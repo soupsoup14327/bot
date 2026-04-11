@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "register-commands": "node src/register-commands.js"
+    "register-commands": "node src/register-commands.js",
+    "postinstall": "node -e \"require('fs').copyFileSync('node_modules/libsodium/dist/modules-esm/libsodium.mjs','node_modules/libsodium-wrappers/dist/modules-esm/libsodium.mjs')\""
   },
   "engines": {
     "node": ">=18.17"
@@ -15,7 +16,8 @@
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.7",
     "ffmpeg-static": "^5.2.0",
-    "libsodium-wrappers": "^0.7.15",
+    "libsodium": "^0.7.16",
+    "libsodium-wrappers": "^0.7.16",
     "opusscript": "^0.1.1",
     "play-dl": "^1.9.7"
   }
