@@ -1,0 +1,22 @@
+{
+  "name": "discord-ollama-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "register-commands": "node src/register-commands.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.7",
+    "ffmpeg-static": "^5.2.0",
+    "libsodium-wrappers": "^0.7.15",
+    "opusscript": "^0.1.1",
+    "play-dl": "^1.9.7"
+  }
+}
