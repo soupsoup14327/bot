@@ -1,18 +1,60 @@
+/**
+ * index.js — точка входа Discord-бота.
+ *
+ * После рефакторинга Шага 10 этот файл — тонкий роутер:
+ *
+ *   Discord event → parse → (orchestrator.commands.* | music.enqueue |
+ *                            addTracksAndUpdateUI | handleButtonInteractions)
+ *
+ * Он НЕ владеет state'ом, НЕ знает как устроены очередь / плеер / voice.
+ * Весь функционал живёт в доменных модулях; index.js только:
+ *
+ *   1. Создаёт Discord `Client`.
+ *   2. Инициализирует music-panel (initMusicUi).
+ *   3. Регистрирует callback'и voice-adapter → orchestrator.events + auto-leave.
+ *   4. Слушает `voiceStateUpdate` и обновляет listeners-count в session-state.
+ *   5. Маршрутизирует:
+ *       - slash-команды /chat /image /play /skip /stop,
+ *       - кнопки музыкальной панели → button-handlers,
+ *       - модальное окно /play (через кнопку «+ добавить») → music.enqueue.
+ *
+ * Все Domain-вызовы идут через `orchestrator.commands.*`. Прямой `music.js`
+ * использован только для `enqueue` (нет command-эквивалента для full
+ * enqueue-flow с панелью) и `registerAutoplayUserQuery` (регистратор
+ * контекста автоплея, не команда управления).
+ */
+
 import 'dotenv/config';
 import {
   Client,
-  GatewayIntentBits,
   EmbedBuilder,
+  GatewayIntentBits,
+  MessageFlags,
   Partials,
 } from 'discord.js';
 import sodium from 'libsodium-wrappers';
+
 import { chatOllama } from './ollama.js';
-import { enqueue, skip, stopAndLeave } from './music.js';
+import { enqueue, registerAutoplayUserQuery } from './music.js';
+import { orchestrator } from './orchestrator.js';
+import {
+  addTracksAndUpdateUI,
+  initMusicUi,
+} from './music-panel.js';
+import {
+  attachVoiceAutoLeave,
+  registerVoiceAdapterCallbacks,
+} from './voice-adapter.js';
+import { handleButtonInteractions } from './button-handlers.js';
+import { FIELD_PLAY_QUERY, MODAL_PLAY } from './ui-components.js';
+import { updateListenersCount } from './guild-session-state.js';
+import { formatSingleQueueLine } from './queue-line-format.js';
 
 await sodium.ready;
 
 const SYSTEM =
-  'Ты дружелюбный помощник в Discord. Отвечай кратко и по делу. Если пользователь просит музыку или картинку, подскажи команды /play и /image.';
+  'Ты дружелюбный помощник в Discord. Отвечай кратко и по делу. ' +
+  'Если пользователь просит музыку или картинку, подскажи команды /play и /image.';
 
 const token = process.env.DISCORD_TOKEN;
 if (!token) {
@@ -24,29 +66,181 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
   ],
   partials: [Partials.Channel],
 });
 
+// ─── Wiring infra-слоя ────────────────────────────────────────────────────────
+
+/**
+ * voice-adapter ↔ orchestrator.events: один источник истины о lifecycle
+ * voice-соединений (onVoiceReady → startSession, onVoiceGone → endSession).
+ *
+ * onAutoLeaveTimeout делегирует полный teardown в orchestrator.commands.stopAndLeave —
+ * это корректно завершает цепочку: stop-player → clearState → voice.leave →
+ * (onVoiceGone фаернется оттуда и запишет endSession).
+ */
+registerVoiceAdapterCallbacks({
+  onVoiceReady: (guildId, channelId) => orchestrator.events.onVoiceReady(guildId, channelId),
+  onVoiceGone: (guildId, reason) => orchestrator.events.onVoiceGone(guildId, reason),
+  onAutoLeaveTimeout: (guildId) => {
+    orchestrator.commands.stopAndLeave(guildId);
+  },
+});
+
+attachVoiceAutoLeave(client);
+initMusicUi(client);
+
+// ─── Listener count (voiceStateUpdate) ────────────────────────────────────────
+
+/**
+ * Пересчитать живых слушателей в voice-канале после любого voiceStateUpdate.
+ * «Живой» = не бот, не server-deafened, не self-deafened.
+ * Self-muted считается: он может слышать.
+ *
+ * Если в гильдии бот не в voice-канале — ставим 0. Это нужно, чтобы auto-leave
+ * таймер и сигналы track_* видели консистентное значение.
+ *
+ * @param {import('discord.js').Guild} guild
+ */
+async function recomputeListenersForGuild(guild) {
+  if (!guild) return;
+  const guildId = String(guild.id);
+  const snap = orchestrator.commands; // для tree-shake-friendly ссылки
+  void snap;
+  try {
+    await guild.voiceStates.fetch();
+  } catch { /* best effort */ }
+
+  // Возьмём канал бота через его VoiceState; если он не в канале — 0.
+  const me = guild.members.me;
+  const myVoice = me?.voice?.channelId;
+  if (!myVoice) {
+    updateListenersCount(guildId, 0);
+    return;
+  }
+  const ch = guild.channels.cache.get(myVoice);
+  if (!ch?.isVoiceBased()) {
+    updateListenersCount(guildId, 0);
+    return;
+  }
+  let n = 0;
+  for (const m of ch.members.values()) {
+    if (m.user.bot) continue;
+    const v = m.voice;
+    if (v?.serverDeaf || v?.selfDeaf) continue;
+    n++;
+  }
+  updateListenersCount(guildId, n);
+}
+
+client.on('voiceStateUpdate', (oldState, newState) => {
+  const guild = newState.guild ?? oldState.guild;
+  if (!guild) return;
+  void recomputeListenersForGuild(guild);
+});
+
+// ─── Utils ───────────────────────────────────────────────────────────────────
+
 function pollinationsUrl(prompt) {
-  const q = encodeURIComponent(prompt.slice(0, 900));
+  const q = encodeURIComponent(String(prompt ?? '').slice(0, 900));
   return `https://image.pollinations.ai/prompt/${q}?width=1024&height=1024&nologo=true`;
 }
+
+async function replyErrorEphemeral(interaction, err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  const content = `Ошибка: ${String(msg).slice(0, 500)}`;
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content });
+    } else {
+      await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    }
+  } catch { /* swallow — пользователю уже ничего не покажем */ }
+}
+
+/**
+ * Общий enqueue-поток: /play или модалка через «+ добавить».
+ * Разворачивает enqueue + ставит ephemeral-ответ + добавляет строку в сессионный
+ * список и панель через `addTracksAndUpdateUI`.
+ *
+ * @param {import('discord.js').ChatInputCommandInteraction | import('discord.js').ModalSubmitInteraction} interaction
+ * @param {string} rawQuery
+ */
+async function runEnqueueFlow(interaction, rawQuery) {
+  const member = await interaction.guild?.members.fetch(interaction.user.id).catch(() => null);
+  const voice = member?.voice?.channel;
+  if (!voice?.isVoiceBased()) {
+    const content = 'Зайди в голосовой канал и повтори команду.';
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content });
+    } else {
+      await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+
+  const guildId = String(interaction.guildId);
+  registerAutoplayUserQuery(guildId, rawQuery);
+
+  const result = await enqueue(
+    voice,
+    rawQuery,
+    'single',
+    interaction.user.id,
+    interaction.user.displayName ?? interaction.user.username ?? null,
+  );
+
+  const line = formatSingleQueueLine(result.trackLabel, {
+    addedBy: interaction.user.displayName ?? interaction.user.username ?? null,
+  });
+
+  await addTracksAndUpdateUI(interaction, [line], result.panelHint);
+}
+
+// ─── Lifecycle ───────────────────────────────────────────────────────────────
 
 client.once('ready', (c) => {
   console.log(`В сети как ${c.user.tag}`);
 });
 
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+// ─── interactionCreate router ────────────────────────────────────────────────
 
+client.on('interactionCreate', async (interaction) => {
   try {
+    if (interaction.isButton()) {
+      await handleButtonInteractions(interaction);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === MODAL_PLAY) {
+      if (!interaction.guild) {
+        await interaction.reply({ content: 'Только на сервере.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const query = interaction.fields.getTextInputValue(FIELD_PLAY_QUERY)?.trim() ?? '';
+      if (!query) {
+        await interaction.reply({ content: 'Пустой запрос.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      try {
+        await runEnqueueFlow(interaction, query);
+      } catch (err) {
+        console.error('[modal /play]', err);
+        await replyErrorEphemeral(interaction, err);
+      }
+      return;
+    }
+
+    if (!interaction.isChatInputCommand()) return;
+
     if (interaction.commandName === 'chat') {
       await interaction.deferReply();
       const text = interaction.options.getString('text', true);
       const reply = await chatOllama(text, SYSTEM);
-      const chunk = reply.slice(0, 3900);
-      await interaction.editReply(chunk);
+      await interaction.editReply(String(reply ?? '').slice(0, 3900));
       return;
     }
 
@@ -56,7 +250,7 @@ client.on('interactionCreate', async (interaction) => {
       const url = pollinationsUrl(prompt);
       const embed = new EmbedBuilder()
         .setTitle('Картинка')
-        .setDescription(`Промпт: ${prompt.slice(0, 500)}`)
+        .setDescription(`Промпт: ${String(prompt).slice(0, 500)}`)
         .setImage(url)
         .setFooter({ text: 'Генерация через image.pollinations.ai' });
       await interaction.editReply({ embeds: [embed], content: url });
@@ -64,41 +258,38 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.commandName === 'play') {
-      const member = interaction.member;
-      const voice = member?.voice?.channel;
-      if (!voice?.isVoiceBased()) {
-        await interaction.reply({
-          content: 'Зайди в голосовой канал и повтори команду.',
-          ephemeral: true,
-        });
+      if (!interaction.guild) {
+        await interaction.reply({ content: 'Только на сервере.', flags: MessageFlags.Ephemeral });
         return;
       }
-      await interaction.deferReply();
-      const query = interaction.options.getString('query', true);
-      await enqueue(voice, query);
-      await interaction.editReply(`В очередь: **${query}**`);
+      const query = interaction.options.getString('query', true).trim();
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      try {
+        await runEnqueueFlow(interaction, query);
+      } catch (err) {
+        console.error('[slash /play]', err);
+        await replyErrorEphemeral(interaction, err);
+      }
       return;
     }
 
     if (interaction.commandName === 'skip') {
-      const ok = skip(interaction.guildId);
-      await interaction.reply(ok ? 'Пропуск…' : 'Ничего не играет.');
+      const res = orchestrator.commands.skip(interaction.guildId, interaction.user.id);
+      await interaction.reply({
+        content: res.ok ? 'Пропуск…' : 'Ничего не играет.',
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     }
 
     if (interaction.commandName === 'stop') {
-      stopAndLeave(interaction.guildId);
-      await interaction.reply('Остановлено.');
+      orchestrator.commands.stopAndLeave(interaction.guildId);
+      await interaction.reply({ content: 'Остановлено.', flags: MessageFlags.Ephemeral });
       return;
     }
   } catch (err) {
-    console.error(err);
-    const msg = err instanceof Error ? err.message : String(err);
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply({ content: `Ошибка: ${msg.slice(0, 500)}` }).catch(() => {});
-    } else {
-      await interaction.reply({ content: `Ошибка: ${msg.slice(0, 500)}`, ephemeral: true }).catch(() => {});
-    }
+    console.error('[interactionCreate]', err);
+    await replyErrorEphemeral(interaction, err);
   }
 });
 

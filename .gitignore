@@ -2,3 +2,8 @@ node_modules/
 .env
 *.log
 .DS_Store
+
+# Runtime-artefacts produced by the bot itself — regenerated on each run.
+# signals.json is a ring-buffer for autoplay context; metrics/** — diagnostics.
+data/
+

@@ -5,6 +5,11 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
+    "test": "node --test",
+    "test:watch": "node --test --watch",
+    "verify": "node scripts/verify-modules.mjs && node scripts/verify-env.mjs && node --test",
+    "verify:env": "node scripts/verify-env.mjs",
+    "kill-bots": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/kill-bot-instances.ps1",
     "register-commands": "node src/register-commands.js",
     "postinstall": "node -e \"require('fs').copyFileSync('node_modules/libsodium/dist/modules-esm/libsodium.mjs','node_modules/libsodium-wrappers/dist/modules-esm/libsodium.mjs')\""
   },
@@ -18,7 +23,7 @@
     "ffmpeg-static": "^5.2.0",
     "libsodium": "^0.7.16",
     "libsodium-wrappers": "^0.7.16",
-    "opusscript": "^0.1.1",
-    "play-dl": "^1.9.7"
+    "play-dl": "^1.9.7",
+    "youtube-dl-exec": "^3.1.5"
   }
 }

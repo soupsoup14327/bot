@@ -1,0 +1,1621 @@
+import {
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
+  VoiceConnectionStatus,
+  StreamType,
+  createAudioPlayer,
+  createAudioResource,
+  entersState,
+  getVoiceConnection,
+  joinVoiceChannel,
+} from '@discordjs/voice';
+import ffmpegPath from 'ffmpeg-static';
+import play from 'play-dl';
+import youtubeDl from 'youtube-dl-exec';
+import { groqNextTrackQuery, groqPlaylistQueries, isGroqConfigured } from './groq.js';
+
+if (ffmpegPath) {
+  process.env.FFMPEG_PATH = ffmpegPath;
+}
+
+/** @typedef {{ queue: string[], player: import('@discordjs/voice').AudioPlayer, connection: import('@discordjs/voice').VoiceConnection | null, playing: boolean, ytdlp: import('child_process').ChildProcess | null }} GuildMusicState */
+
+/** @type {Map<string, GuildMusicState>} */
+const guildState = new Map();
+
+/** Стек URL предыдущих треков (для ⏮️), последний = только что уступивший дорогу. */
+/** @type {Map<string, string[]>} */
+const pastTrackUrlsByGuild = new Map();
+
+const PAST_TRACKS_CAP = 50;
+
+/** Порядок проигранных watch URL за сессию (для ⏮ после доигрывания — не зависит от сокращений past stack). */
+/** @type {Map<string, string[]>} */
+const sessionPlayedWatchUrlsByGuild = new Map();
+const SESSION_PLAYED_CAP = 80;
+
+/**
+ * Названия всех треков сыгранных за сессию.
+ * Используется как контекст для Groq при предсказании следующего трека автоплея.
+ * Пишется всегда (не только при активном автоплее) — чтобы Groq видел полный контекст
+ * включая треки добавленные вручную до включения ∞.
+ */
+/** @type {Map<string, string[]>} */
+const autoplaySessionTitlesByGuild = new Map();
+const AUTOPLAY_TITLES_CAP = 20;
+
+/**
+ * После ⏮ один раз не добавлять urlLeft в past stack при старте «назад» —
+ * иначе снова появляется «предыдущий» к текущему и кнопка не гаснет на первом треке.
+ * @type {Set<string>}
+ */
+const suppressHistoryPushByGuild = new Set();
+
+/**
+ * После ⏮ с конца очереди: URL трека «вперёд» (тот что только что доиграл), без автоплея —
+ * подставляется в очередь только по ⏭ (см. skip).
+ * @type {Map<string, string>}
+ */
+const idleBackForwardTailByGuild = new Map();
+
+/**
+ * Индекс в sessionPlayedWatchUrls куда смотрит «текущий» при навигации после idle.
+ * Null = навигация не начата (смотрим на последний).
+ * @type {Map<string, number>}
+ */
+const idleNavCursorByGuild = new Map();
+
+/** Повтор текущего трека: true = не сдвигать queue после воспроизведения. */
+/** @type {Set<string>} */
+const repeatByGuild = new Set();
+
+/** Автоплей: когда очередь кончается, бот сам добавляет похожую подборку. */
+/** @type {Set<string>} */
+const autoplayByGuild = new Set();
+
+/**
+ * Зерно запроса для автоплея — сохраняется из последней подборки или названия трека.
+ * @type {Map<string, string>}
+ */
+const autoplaySeedQueryByGuild = new Map();
+
+/**
+ * Оригинальный элемент очереди (queryOrUrl), который сейчас играет.
+ * Нужен для того, чтобы при включении repeat в середине трека (когда элемент уже
+ * был сдвинут из очереди) вернуть его обратно.
+ * @type {Map<string, string>}
+ */
+const currentQueueItemByGuild = new Map();
+
+/** Переключить повтор для гильдии; возвращает новое состояние. */
+export function toggleRepeat(guildId) {
+  if (guildId == null) return false;
+  const id = String(guildId);
+  if (repeatByGuild.has(id)) {
+    repeatByGuild.delete(id);
+    return false;
+  }
+  repeatByGuild.add(id);
+  /** Repeat и autoplay взаимоисключающие — выключаем autoplay. */
+  autoplayByGuild.delete(id);
+  /**
+   * Если трек уже играет, но был сдвинут из очереди до включения repeat
+   * (пользователь включил repeat в середине трека) — вернуть его в начало очереди.
+   */
+  const s = guildState.get(id);
+  const currentItem = currentQueueItemByGuild.get(id);
+  if (s?.playing && currentItem && s.queue[0] !== currentItem) {
+    s.queue.unshift(currentItem);
+  }
+  return true;
+}
+
+/** Текущее состояние повтора. */
+export function isRepeatEnabled(guildId) {
+  if (guildId == null) return false;
+  return repeatByGuild.has(String(guildId));
+}
+
+/** Переключить автоплей; возвращает новое состояние. */
+export function toggleAutoplay(guildId) {
+  if (guildId == null) return false;
+  const id = String(guildId);
+  if (autoplayByGuild.has(id)) {
+    autoplayByGuild.delete(id);
+    return false;
+  }
+  autoplayByGuild.add(id);
+  /** Repeat и autoplay взаимоисключающие — выключаем repeat. */
+  repeatByGuild.delete(id);
+  return true;
+}
+
+/**
+ * Сохранить зерно запроса для автоплея (вызывается при подборке).
+ * Всегда перезаписывает — подборка является приоритетным источником темы.
+ */
+export function setAutoplaySeed(guildId, query) {
+  if (guildId == null || !query) return;
+  autoplaySeedQueryByGuild.set(String(guildId), String(query).trim());
+}
+
+/**
+ * Установить seed только если он ещё не задан в этой сессии.
+ * Используется для одиночных треков — не перезаписывает тему подборки.
+ */
+export function setAutoplaySeedIfEmpty(guildId, query) {
+  if (guildId == null || !query) return;
+  const id = String(guildId);
+  if (!autoplaySeedQueryByGuild.has(id)) {
+    autoplaySeedQueryByGuild.set(id, String(query).trim());
+  }
+}
+
+/**
+ * Модификаторы запроса для автоплея — добавляют лёгкое разнообразие при каждом цикле.
+ * Пустые строки намеренно — чаще всего запрос остаётся без изменений.
+ */
+const AUTOPLAY_MODIFIERS = ['', '', '', '', 'best', 'new', 'similar', 'top', 'classic'];
+
+/** Возвращает слегка варьированный запрос для следующей подборки автоплея. */
+function variantAutoplayQuery(base) {
+  const mod = AUTOPLAY_MODIFIERS[Math.floor(Math.random() * AUTOPLAY_MODIFIERS.length)];
+  return mod ? `${base} ${mod}` : base;
+}
+
+/**
+ * Асинхронно ищет и ставит в очередь новый трек для автоплея.
+ * Вызывается void — не блокирует цепочку воспроизведения.
+ */
+async function spawnAutoplayPlaylist(guildId, seedQuery) {
+  const id = String(guildId);
+
+  /** Groq генерирует умный запрос на основе темы + истории треков. Fallback — стандартный вариант. */
+  const playedTitles = autoplaySessionTitlesByGuild.get(id) ?? [];
+  let variant;
+  if (isGroqConfigured()) {
+    try {
+      variant = await groqNextTrackQuery(seedQuery, playedTitles);
+      console.log(`[autoplay] groq query="${variant}"`);
+    } catch (e) {
+      variant = variantAutoplayQuery(seedQuery);
+      console.log(`[autoplay] groq fallback (${e instanceof Error ? e.message : e}) q="${variant}"`);
+    }
+  } else {
+    variant = variantAutoplayQuery(seedQuery);
+  }
+  console.log(`[autoplay] spawning guild=${id} q="${variant}"`);
+  try {
+    const items = await pickDistinctTrackVideos(variant, 1, { skipGroq: true });
+    if (!items.length) throw new Error('empty result');
+
+    const s = guildState.get(id);
+    // Соединение пропало или пользователь отключил автоплей пока шёл поиск
+    if (!s?.connection || s.connection.state.status === VoiceConnectionStatus.Destroyed) return;
+    if (!autoplayByGuild.has(id)) return;
+    // Пользователь успел добавить треки вручную — не дублируем
+    if (s.playing || s.queue.length > 0) return;
+
+    for (const it of items) {
+      s.queue.push(it.url);
+    }
+    void queuePlayNext(id);
+    console.log(`[autoplay] queued ${items.length} tracks guild=${id}`);
+    if (onAutoplaySpawned) {
+      try {
+        onAutoplaySpawned(id, items, variant);
+      } catch {}
+    }
+  } catch (e) {
+    console.warn('[autoplay] failed', id, e instanceof Error ? e.message : e);
+    // Поиск не удался — обновляем UI в idle-состояние
+    if (onPlaybackIdle) {
+      try {
+        onPlaybackIdle(id);
+      } catch {}
+    }
+  }
+}
+
+/** @type {((guildId: string, items: {title: string, url: string}[], query: string) => void) | null} */
+let onAutoplaySpawned = null;
+
+/** Вызывается когда автоплей успешно добавил новую подборку в очередь. */
+export function setOnAutoplaySpawned(fn) {
+  onAutoplaySpawned = fn;
+}
+
+/** @type {((guildId: string) => void) | null} */
+let onMusicForceStop = null;
+
+/** Только при «Остановить», авто-выходе из голоса — не при естественном конце очереди. */
+export function setOnMusicForceStop(fn) {
+  onMusicForceStop = fn;
+}
+
+/** @type {((guildId: string, label: string) => void) | null} */
+let onPlayingTrackDisplay = null;
+
+/** Смена трека (skip / следующий из очереди) — обновить текст панели в чате. */
+export function setOnPlayingTrackDisplay(fn) {
+  onPlayingTrackDisplay = fn;
+}
+
+/** @type {((guildId: string) => void) | null} */
+let onPlaybackIdle = null;
+
+/** Очередь закончилась (или скип последнего), голос ещё подключён — панель в режим ожидания (сообщения в чате не удаляются). */
+export function setOnPlaybackIdle(fn) {
+  onPlaybackIdle = fn;
+}
+
+/** @type {import('discord.js').Client | null} */
+let voiceClient = null;
+
+/** URL текущего ролика YouTube — для кнопки «Ещё раз». */
+/** @type {Map<string, string>} */
+const currentPlayingUrlByGuild = new Map();
+/** Человекочитаемое название текущего/последнего трека (для панели и «Ещё раз»). */
+/** @type {Map<string, string>} */
+const currentPlayingLabelByGuild = new Map();
+
+/** Ссылка на то, что сейчас играет (или последний сыгранный URL), для дубля в очередь. */
+export function getRepeatableTrackUrl(guildId) {
+  if (guildId == null) return null;
+  return currentPlayingUrlByGuild.get(String(guildId)) ?? null;
+}
+
+/** Название того же трека, что и у getRepeatableTrackUrl (если есть). */
+export function getRepeatableTrackLabel(guildId) {
+  if (guildId == null) return null;
+  return currentPlayingLabelByGuild.get(String(guildId)) ?? null;
+}
+
+function getVoiceEmptyDelayMs() {
+  const mins = Number.parseFloat(process.env.VOICE_EMPTY_LEAVE_MINUTES ?? '1');
+  const minutes = Number.isFinite(mins) && mins > 0 ? mins : 1;
+  return Math.max(1, minutes) * 60_000;
+}
+
+/** @type {Map<string, NodeJS.Timeout>} */
+const voiceEmptyTimers = new Map();
+
+function clearVoiceEmptyTimer(guildId) {
+  const t = voiceEmptyTimers.get(guildId);
+  if (t) clearTimeout(t);
+  voiceEmptyTimers.delete(guildId);
+}
+
+/**
+ * Если в голосе остались только боты — через N минут выходим из канала.
+ * @param {import('discord.js').Client} client
+ */
+export function attachVoiceAutoLeave(client) {
+  voiceClient = client;
+  const ms = getVoiceEmptyDelayMs();
+
+  client.on('voiceStateUpdate', (oldState, newState) => {
+    const guild = newState.guild ?? oldState.guild;
+    if (!guild) return;
+    void checkVoiceChannelEmpty(guild, ms);
+  });
+}
+
+/**
+ * @param {import('discord.js').Guild} guild
+ * @param {number} delayMs
+ */
+async function checkVoiceChannelEmpty(guild, delayMs) {
+  const conn = getVoiceConnection(guild.id);
+  if (!conn) {
+    clearVoiceEmptyTimer(guild.id);
+    return;
+  }
+  const channelId = conn.joinConfig.channelId;
+  if (!channelId) {
+    clearVoiceEmptyTimer(guild.id);
+    return;
+  }
+
+  try {
+    await guild.voiceStates.fetch();
+  } catch {
+    /* ignore */
+  }
+
+  const ch = await guild.channels.fetch(channelId).catch(() => null);
+  if (!ch?.isVoiceBased()) {
+    clearVoiceEmptyTimer(guild.id);
+    return;
+  }
+
+  const humans = ch.members.filter((m) => !m.user.bot).size;
+  if (humans > 0) {
+    clearVoiceEmptyTimer(guild.id);
+    return;
+  }
+
+  if (voiceEmptyTimers.has(guild.id)) return;
+  const t = setTimeout(() => {
+    voiceEmptyTimers.delete(guild.id);
+    void (async () => {
+      const g = await voiceClient?.guilds.fetch(guild.id).catch(() => null);
+      if (!g) return;
+      const conn = getVoiceConnection(guild.id);
+      if (!conn) return;
+      const cid = conn.joinConfig.channelId;
+      if (!cid) return;
+      try {
+        await g.voiceStates.fetch();
+      } catch {
+        /* ignore */
+      }
+      const vch = await g.channels.fetch(cid).catch(() => null);
+      if (!vch?.isVoiceBased()) return;
+      if (vch.members.filter((m) => !m.user.bot).size > 0) return;
+      stopAndLeave(guild.id);
+      console.log(
+        `[music] авто-выход из голоса (нет людей ${Math.round(delayMs / 60000)} мин), guild ${guild.id}`,
+      );
+    })();
+  }, delayMs);
+  voiceEmptyTimers.set(guild.id, t);
+}
+
+function killYtdlp(s) {
+  if (!s?.ytdlp) return;
+  try {
+    s.ytdlp.kill('SIGKILL');
+  } catch {
+    /* ignore */
+  }
+  s.ytdlp = null;
+}
+
+/** Уточняет запрос, чтобы чаще находить именно трек, а не обзор/разбор. */
+function augmentYoutubeSearchQuery(q) {
+  const s = q.trim();
+  if (!s) return s;
+  const wantsTheme =
+    /опенинг|опеннинг|\bopening\b|\bop\s|opening\s|\[op\]|эндинг|\bending\b|\bed\s|саундтрек|soundtrack|\bost\b|тема\s+из/i.test(
+      s,
+    );
+  if (!wantsTheme) return s;
+  if (/full\s+(song|version)|theme\s+song|lyrics|караоке|karaoke|tv\s*size/i.test(s)) return s;
+  return `${s} full opening theme song lyrics`;
+}
+
+const BAD_TITLE_HINTS = [
+  'обзор',
+  'разбор',
+  'распаковка',
+  'рассказ',
+  'рассказываю',
+  'топ-10',
+  'топ 10',
+  ' топ ',
+  'top 10',
+  'top 5',
+  ' фактов',
+  'факты о',
+  '10 факт',
+  'всё об',
+  'все об',
+  'об этом аниме',
+  'об аниме',
+  'explained',
+  'review',
+  'reaction',
+  'reacts',
+  ' podcast',
+  'documentary',
+  ' стрим',
+  'сюжет',
+  'история аниме',
+  'lore ',
+  ' лор',
+  'ending explained',
+  'everything about',
+  'who is',
+  'что такое',
+  'кратко о',
+  'за 10 минут',
+  'за 15 минут',
+  'за 20 минут',
+  'ranking',
+  'tier list',
+  'worth watch',
+  'стоит смотреть',
+  'стоит ли',
+  'trailer',
+  'трейлер',
+  'teaser',
+  'анонс',
+  'gameplay',
+  'walkthrough',
+  'типичн',
+  'vs ',
+  'comparison',
+  'сравнен',
+  'спойлер',
+  'spoiler',
+  'рекап',
+  'recap',
+  'нарезк',
+  'compilation',
+  'moments',
+  'смешн',
+  'прикол',
+  'смысл ',
+  'meaning of',
+  'secret of',
+  'тайн',
+  'секрет',
+  'теория',
+  'theory',
+  'hidden meaning',
+  'true story',
+  'значение',
+];
+
+const GOOD_TITLE_HINTS = [
+  'opening',
+  ' op ',
+  '[op]',
+  'ending',
+  ' ed ',
+  '[ed]',
+  'ost',
+  'soundtrack',
+  'theme song',
+  'full version',
+  'full song',
+  'lyrics',
+  'lyric',
+  'tv size',
+  'опенинг',
+  'эндинг',
+  'саундтрек',
+  'полная версия',
+  'караоке',
+  'karaoke',
+  'instrumental',
+  'music video',
+  ' mv ',
+  'official',
+  '公式',
+];
+
+/**
+ * Выбирает видео с наибольшим шансом быть именно музыкой, а не эссе про аниме.
+ * @param {unknown[]} results
+ * @param {string} originalQuery
+ */
+function pickBestYoutubeSearchResult(results, originalQuery) {
+  if (!results?.length) return null;
+  const q = originalQuery.toLowerCase();
+  const stop = new Set([
+    'the',
+    'a',
+    'an',
+    'and',
+    'or',
+    'из',
+    'с',
+    'со',
+    'в',
+    'на',
+    'по',
+    'для',
+    'опенинг',
+    'опеннинг',
+    'opening',
+    'включи',
+    'поставь',
+    'play',
+    'song',
+    'track',
+    'music',
+  ]);
+  const queryTokens = q
+    .split(/[^a-zа-яё0-9]+/iu)
+    .filter((w) => w.length > 2 && !stop.has(w));
+
+  let best = results[0];
+  let bestScore = -Infinity;
+
+  for (const video of results) {
+    const title = String(video?.title ?? '').toLowerCase();
+    const desc = String(video?.description ?? '')
+      .slice(0, 240)
+      .toLowerCase();
+    const blob = `${title} ${desc}`;
+    let score = 0;
+
+    for (const w of BAD_TITLE_HINTS) {
+      if (blob.includes(w)) score -= 12;
+    }
+    for (const w of GOOD_TITLE_HINTS) {
+      if (blob.includes(w)) score += 6;
+    }
+
+    const sec = Number(video?.durationInSec) || 0;
+    if (video?.live) score -= 30;
+    if (sec > 0) {
+      if (sec < 20) score -= 6;
+      else if (sec >= 45 && sec <= 420) score += 5;
+      if (sec > 480) score -= 10;
+      if (sec > 900) score -= 8;
+    }
+
+    for (const w of queryTokens) {
+      if (title.includes(w)) score += 3;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = video;
+    }
+  }
+
+  return best;
+}
+
+/** Доп. минусы: квизы, «100 опенингов», часовые mix. */
+const PLAYLIST_EXTRA_BAD = [
+  'угадай',
+  'угада',
+  'guess the',
+  'guess 1',
+  'guess ',
+  'quiz',
+  'квиз',
+  'challenge',
+  'try to guess',
+  'opening quiz',
+  'anime quiz',
+  'все опенинг',
+  'all openings',
+  'all anime',
+  'hour long',
+  '10 hours',
+  '24/7',
+  'non-stop',
+  'nonstop',
+  'mega mix',
+  'megamix',
+  'marathon',
+  'hours of',
+  'часов ',
+  'плейлист на',
+  'full album',
+  'компиляц',
+  'compilation',
+  'tiktok compilation',
+  'nightcore mix',
+];
+
+function normalizePlaylistTheme(raw) {
+  return raw
+    .trim()
+    .replace(/опенинги|опенингов|опенингам/giu, 'opening')
+    .replace(/\bops\b/giu, 'opening');
+}
+
+function buildPlaylistSearchQuery(raw) {
+  const s = normalizePlaylistTheme(raw);
+  if (!s) return s;
+  if (/аниме|anime/i.test(s)) {
+    if (/опенинг|опеннинг|opening|\bop\b|эндинг|ending|\bed\b/i.test(s)) {
+      return `${s} full opening song official audio`;
+    }
+    return `${s} anime soundtrack official song`;
+  }
+  if (/хип[\s-]*хоп|hip[\s-]*hop|\brap\b|рэп/i.test(s)) {
+    return `${s} hip hop song official audio`;
+  }
+  if (/лофай|lo[\s-]?fi|lofi/i.test(s)) {
+    return `${s} lofi music single`;
+  }
+  return `${s} music official audio song`;
+}
+
+/** Жёсткий отсев квизов и мегаподборок (без скоринга). */
+function hardRejectPlaylistTitle(title) {
+  const s = String(title).toLowerCase();
+  if (/угадай|угада|guess|quiz|квиз|challenge|try to guess|can you guess/i.test(s)) return true;
+  if (/\b(20|25|30|40|50|60|70|80|90|100|150|200|300|500)\b.*(опенинг|opening|openings|аниме|anime)/i.test(s))
+    return true;
+  if (/(опенинг|opening|openings).*\b(20|25|30|40|50|60|70|80|90|100|150|200)\b/i.test(s))
+    return true;
+  if (/\d+\s+лучш|лучш(их|ие|ий)\s+\d+/i.test(s)) return true;
+  if (/\bbest\s+\d+\b|\b\d+\s+best\b/i.test(s)) return true;
+  if (/\btop\s*(10|15|20|25|30|40|50|100|150|200)\b/i.test(s)) return true;
+  if (/\bтоп\s*(10|15|20|25|30|40|50|100|150|200)\b/i.test(s)) return true;
+  if (/\btop\s+\d+\b/i.test(s)) return true;
+  if (/most[\s-]?(looked|watched|popular)|all\s+time|of\s+all\s+time/i.test(s)) return true;
+  if (
+    /watches?:|watch(es)?\s+top|watch\s+party|react(s|ion)?\s+to|нарезк|реакц|смотрит|стинт|stint|highlight/i.test(
+      s,
+    )
+  )
+    return true;
+  if (/лучших.*опен|best.*opening|greatest.*opening/i.test(s)) return true;
+  if (/подряд|non-?stop|megamix|mega mix|marathon|\d+\s*час|hours of|compilation|компиляц|full\s+album/i.test(s))
+    return true;
+  if (/рабоч(ая|ей)\s+музык|working\s+music|study\s+music|background\s+music|music\s+for\s+work|concentration|productivity/i.test(s))
+    return true;
+  if (/\b1\s*час\b|\b\d+\s*hours?\b|\b\d+h\s+(of|mix|music)/i.test(s)) return true;
+  return false;
+}
+
+/**
+ * @param {Record<string, unknown>} video
+ * @param {string} originalQuery
+ */
+function scoreVideoForPlaylist(video, originalQuery) {
+  const title = String(video?.title ?? '').toLowerCase();
+  const desc = String(video?.description ?? '')
+    .slice(0, 280)
+    .toLowerCase();
+  const blob = `${title} ${desc}`;
+  let score = 0;
+
+  for (const w of BAD_TITLE_HINTS) {
+    if (blob.includes(w)) score -= 14;
+  }
+  for (const w of PLAYLIST_EXTRA_BAD) {
+    if (blob.includes(w)) score -= 22;
+  }
+  for (const w of GOOD_TITLE_HINTS) {
+    if (blob.includes(w)) score += 7;
+  }
+
+  const sec = Number(video?.durationInSec) || 0;
+  if (sec > 0) {
+    if (sec >= 60 && sec <= 360) score += 14;
+    else if (sec > 360 && sec <= 480) score += 4;
+    if (sec > 420) score -= 12;
+    if (sec > 540) score -= 40;
+  }
+
+  if (/\b(100|150|200|300|500)\b/.test(title)) score -= 22;
+  if (/угадай|guess|quiz|квиз/i.test(title)) score -= 28;
+  if (sec === 0) score -= 55;
+
+  const q = originalQuery.toLowerCase();
+  const words = q
+    .split(/[^a-zа-яё0-9]+/iu)
+    .filter((w) => w.length > 2);
+  for (const w of words) {
+    if (title.includes(w)) score += 2;
+  }
+
+  return score;
+}
+
+/** Для `ytsearchN:…` нельзя оставлять «ломающие» префикс символы. */
+function sanitizeYtSearchQuery(raw) {
+  return String(raw ?? '')
+    .trim()
+    .slice(0, 180)
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/:/g, ' ');
+}
+
+/**
+ * Поиск на YouTube через yt-dlp, если play-dl падает (например browseId на новой разметке).
+ * @param {string} query
+ * @param {number} limit
+ * @returns {Promise<{ url: string, title: string, durationInSec: number, live: boolean, description: string }[]>}
+ */
+async function searchYoutubeVideosViaYtDlp(query, limit) {
+  const safe = sanitizeYtSearchQuery(query);
+  if (!safe) return [];
+  const n = Math.min(Math.max(1, limit), 40);
+  try {
+    const data = await youtubeDl(`ytsearch${n}:${safe}`, {
+      dumpSingleJson: true,
+      flatPlaylist: true,
+      skipDownload: true,
+      quiet: true,
+      noWarnings: true,
+      ignoreErrors: true,
+      socketTimeout: 25,
+      retries: 2,
+      extractorRetries: 2,
+    });
+    const entries = Array.isArray(data?.entries) ? data.entries : [];
+    const out = [];
+    for (const e of entries) {
+      const id = e?.id;
+      if (id == null || String(id).startsWith('@')) continue;
+      const webpage = e?.url || e?.webpage_url;
+      const watchUrl =
+        webpage && /^https?:\/\//i.test(String(webpage))
+          ? String(webpage)
+          : `https://www.youtube.com/watch?v=${id}`;
+      const title = String(e?.title ?? '').trim() || 'Без названия';
+      const dur = Number(e?.duration);
+      const live =
+        e?.live_status === 'is_live' ||
+        e?.live_status === 'is_upcoming' ||
+        e?.was_live === true;
+      out.push({
+        url: watchUrl,
+        title,
+        durationInSec: Number.isFinite(dur) && dur > 0 ? dur : 180,
+        live: Boolean(live),
+        description: '',
+      });
+    }
+    return out;
+  } catch (e) {
+    console.warn('[music] yt-dlp search', e instanceof Error ? e.message : e);
+    return [];
+  }
+}
+
+/**
+ * @param {string} query
+ * @param {number} limit
+ */
+async function searchYoutubeVideosForPlaylist(query, limit) {
+  const lim = Math.min(limit, 35);
+  try {
+    const batch = await play.search(query, {
+      limit: lim,
+      source: { youtube: 'video' },
+    });
+    if (Array.isArray(batch) && batch.length > 0) return batch;
+  } catch (e) {
+    console.warn('[music] play.search', e instanceof Error ? e.message : e);
+  }
+  return searchYoutubeVideosViaYtDlp(query, Math.min(lim, 25));
+}
+
+/**
+ * Несколько разных роликов в духе отдельных треков (не часовые подборки).
+ * @param {string} themeQuery
+ * @param {number} count
+ * @param {{ skipGroq?: boolean }} [opts]
+ * @returns {Promise<{ title: string, url: string }[]>}
+ */
+export async function pickDistinctTrackVideos(themeQuery, count = 6, { skipGroq = false } = {}) {
+  const theme = themeQuery.slice(0, 200).trim();
+  if (!theme) throw new Error('Пустой запрос');
+  const norm = normalizePlaylistTheme(theme);
+  const isAnime = /аниме|anime|опенинг|opening|\bop\b|эндинг|ending|\bed\b/i.test(norm);
+  /**
+   * Жанры где отдельные треки длиннее обычного (5-25 мин) и часовые стримы — норма.
+   * Для них поднимаем потолок длины и подбираем субжанровые запросы вместо суффиксных.
+   */
+  const isLongForm = /ло[\s-]?фай|lo[\s-]?fi|lofi|chillhop|чиллхоп|\bambient\b|амбиент|джаз|jazz/i.test(norm);
+
+  /** Fallback-запросы — используются если Groq недоступен или вернул ошибку. */
+  let fallbackQueries;
+  if (isLongForm) {
+    fallbackQueries = [
+      `${norm} hip hop beats song`,
+      `${norm} chill music track`,
+      `${norm} bedroom pop song`,
+      `${norm} aesthetic music`,
+      `${norm} original song`,
+    ];
+  } else {
+    fallbackQueries = [
+      buildPlaylistSearchQuery(theme),
+      `${norm} lyrics`,
+      isAnime ? `${norm} full song` : `${norm} music video`,
+      isAnime ? `${norm} theme song` : `${norm} official`,
+      `${norm} audio`,
+    ];
+  }
+
+  /**
+   * Groq генерирует тематически точные запросы по настроению/жанру.
+   * Запускаем параллельно с таймаутом 6с — не задерживает поиск.
+   * При любой ошибке тихо падаем на fallback.
+   */
+  let queries;
+  if (isGroqConfigured() && !skipGroq) {
+    try {
+      queries = await Promise.race([
+        groqPlaylistQueries(theme, 5),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 6_000)),
+      ]);
+      console.log(`[podborka] groq queries: ${queries.join(' | ')}`);
+    } catch (e) {
+      queries = fallbackQueries;
+      console.log(`[podborka] groq fallback (${e instanceof Error ? e.message : e})`);
+    }
+  } else {
+    queries = fallbackQueries;
+  }
+
+  /**
+   * Все запросы параллельно — время поиска = время самого медленного вместо суммы.
+   * С каждого берём не более SLOT кандидатов, чтобы ни один запрос не доминировал.
+   */
+  const SLOT = 5;
+  const batches = await Promise.all(queries.map((q) => searchYoutubeVideosForPlaylist(q, 20).catch(() => [])));
+  const seenUrl = new Set();
+  /** @type {unknown[]} */
+  const merged = [];
+  for (const batch of batches) {
+    if (!batch?.length) continue;
+    let taken = 0;
+    for (const v of batch) {
+      if (taken >= SLOT) break;
+      const u = v?.url;
+      if (u && !seenUrl.has(u)) {
+        seenUrl.add(u);
+        merged.push(v);
+        taken++;
+      }
+    }
+  }
+  if (!merged.length) throw new Error('Ничего не найдено');
+
+  /**
+   * Потолок длины: для lo-fi/ambient/jazz — до 25 минут (там трек и 10-15 мин норма),
+   * для всего остального — до 7 минут (стандартный трек/опенинг).
+   */
+  const MAX_SEC = isLongForm ? 1500 : 420;
+
+  const ranked = [];
+  for (const video of merged) {
+    const url = video?.url;
+    if (!url) continue;
+    if (video.live) continue;
+    const title = String(video?.title ?? '');
+    if (hardRejectPlaylistTitle(title)) continue;
+
+    const sec = Number(video.durationInSec);
+    if (!Number.isFinite(sec) || sec <= 0) continue;
+    if (sec < 30 || sec > MAX_SEC) continue;
+
+    const score = scoreVideoForPlaylist(video, themeQuery);
+    if (score < -55) continue;
+    ranked.push({ video, score });
+  }
+  ranked.sort((a, b) => b.score - a.score);
+
+  /**
+   * Выбор: весь пул перемешиваем случайно (Fisher-Yates), затем берём первые count.
+   * Гарантированных «топ» пиков нет — скоринг уже отфильтровал мусор, поэтому
+   * все кандидаты достаточно качественные и можно полностью рандомить.
+   * Дополнительно: не более 2 треков с одного YouTube-канала.
+   */
+  const POOL_SIZE = Math.min(ranked.length, 20);
+  const pool = ranked.slice(0, POOL_SIZE);
+
+  // Перемешиваем весь пул
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+
+  const out = [];
+  const seenFinal = new Set();
+  /** @type {Map<string, number>} */
+  const channelHits = new Map();
+
+  /** @param {unknown} video */
+  function channelKey(video) {
+    return String(video?.channel?.id ?? video?.channel?.name ?? '');
+  }
+
+  function tryAdd(video) {
+    const url = video.url;
+    if (seenFinal.has(url)) return false;
+    const ch = channelKey(video);
+    if (ch && (channelHits.get(ch) ?? 0) >= 2) return false;
+    seenFinal.add(url);
+    if (ch) channelHits.set(ch, (channelHits.get(ch) ?? 0) + 1);
+    out.push({ title: String(video.title || '').trim() || 'Без названия', url });
+    return true;
+  }
+
+  for (const { video } of pool) {
+    if (out.length >= count) break;
+    tryAdd(video);
+  }
+
+  if (out.length === 0) {
+    throw new Error(
+      'Не нашёл отдельных треков (слишком много длинных подборок в выдаче). Сформулируй конкретнее: название трека, группа или «название аниме opening».',
+    );
+  }
+  return out;
+}
+
+async function resolveYoutubeFromQuery(query) {
+  const q = augmentYoutubeSearchQuery(query);
+  let searched = [];
+  try {
+    searched = await play.search(q, { limit: 15, source: { youtube: 'video' } });
+  } catch (e) {
+    console.warn('[music] play.search (resolve)', e instanceof Error ? e.message : e);
+  }
+  if (!Array.isArray(searched) || searched.length === 0) {
+    searched = await searchYoutubeVideosViaYtDlp(q, 10);
+  }
+  const picked = pickBestYoutubeSearchResult(searched, query);
+  if (!picked?.url) throw new Error('Ничего не найдено');
+  return { url: picked.url, label: picked.title || query };
+}
+
+function getState(guildId) {
+  const id = String(guildId);
+  if (!guildState.has(id)) {
+    const player = createAudioPlayer({
+      behaviors: { noSubscriber: NoSubscriberBehavior.Play },
+    });
+    guildState.set(id, {
+      queue: [],
+      player,
+      connection: null,
+      playing: false,
+      ytdlp: null,
+    });
+    player.on(AudioPlayerStatus.Idle, () => {
+      const s = guildState.get(id);
+      if (!s) return;
+      /**
+       * Захватываем флаг ДО обнуления: если трек реально воспроизводился (s.playing=true),
+       * планируем следующий. Иначе — это «отзвук» от уже обработанного Idle (например,
+       * yt-dlp Broken pipe прилетел после того как player.stop() уже выдал первый Idle
+       * и s.playing стал false). Без этой проверки двойной Idle → двойной queuePlayNext
+       * → дубликаты треков при ⏮ / ⏭ с включённым repeat.
+       */
+      const wasPlaying = s.playing;
+      const streamFailed = Boolean(s.ytdlpStreamError);
+      s.playing = false;
+      s.ytdlpStreamError = false;
+      killYtdlp(s);
+      if (wasPlaying) {
+        /**
+         * Если yt-dlp сообщил об ошибке потока И включён repeat — принудительно сдвигаем
+         * очередь, иначе repeat зациклится на упавшем треке (Invalid argument / Broken pipe).
+         */
+        if (streamFailed && repeatByGuild.has(id)) {
+          const currentItem = currentQueueItemByGuild.get(id);
+          if (currentItem && s.queue[0] === currentItem) {
+            s.queue.shift();
+          } else if (currentItem) {
+            const ix = s.queue.indexOf(currentItem);
+            if (ix >= 0) s.queue.splice(ix, 1);
+          }
+          console.warn('[music] stream error with repeat ON — forcing skip', id);
+        }
+        void queuePlayNext(id);
+      }
+    });
+    player.on('error', (e) => {
+      console.error('AudioPlayer error', id, e);
+      killYtdlp(guildState.get(id));
+    });
+  }
+  return guildState.get(id);
+}
+
+/**
+ * Поток аудио с YouTube через yt-dlp (play-dl stream сейчас часто падает на Invalid URL из-за изменений YouTube).
+ * @param {string} url watch URL
+ */
+function createYoutubeStreamProcess(url) {
+  return youtubeDl.exec(
+    url,
+    {
+      output: '-',
+      quiet: true,
+      noWarnings: true,
+      noPlaylist: true,
+      format: 'bestaudio',
+    },
+    {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+}
+
+/**
+ * Хвост цепочки Promise — два Idle/skip подряд не должны дважды shift'нуть очередь.
+ * @type {Map<string, Promise<void>>}
+ */
+const playNextChainTail = new Map();
+
+/**
+ * @param {string} guildId
+ * @returns {Promise<void>}
+ */
+function queuePlayNext(guildId) {
+  const id = String(guildId);
+  const prev = playNextChainTail.get(id) ?? Promise.resolve();
+  const job = prev.then(() => runPlayNext(id));
+  playNextChainTail.set(id, job);
+  void job.finally(() => {
+    if (playNextChainTail.get(id) === job) {
+      playNextChainTail.delete(id);
+    }
+  });
+  return job;
+}
+
+async function runPlayNext(guildId) {
+  const id = String(guildId);
+  const s = guildState.get(id);
+  if (!s) return;
+  if (!s.connection) {
+    if (s.queue.length === 0 && onPlaybackIdle) {
+      try {
+        onPlaybackIdle(id);
+      } catch (e) {
+        console.warn('[music] onPlaybackIdle', e);
+      }
+    }
+    return;
+  }
+  /** Не shift до успешного старта трека — между треками очередь не пуста, лишний Idle не считает сессию завершённой. */
+  const nextItem = s.queue[0];
+  if (!nextItem) {
+    /** Очередь кончилась естественно — сбрасываем repeat, чтобы не светилась кнопка при idle. */
+    repeatByGuild.delete(id);
+    currentQueueItemByGuild.delete(id);
+
+    /**
+     * Автоплей: если включён — запускаем подборку и не обновляем UI в idle,
+     * чтобы панель не мигала «ничего не играет» на доли секунды.
+     * При ошибке поиска spawnAutoplayPlaylist сам вызовет onPlaybackIdle.
+     */
+    if (autoplayByGuild.has(id)) {
+      const seed = autoplaySeedQueryByGuild.get(id) ?? currentPlayingLabelByGuild.get(id);
+      if (seed) {
+        void spawnAutoplayPlaylist(id, seed);
+        return;
+      }
+    }
+
+    if (onPlaybackIdle) {
+      try {
+        onPlaybackIdle(id);
+      } catch (e) {
+        console.warn('[music] onPlaybackIdle', e);
+      }
+    }
+    return;
+  }
+  try {
+    let url = nextItem;
+    let label = nextItem;
+
+    if (play.yt_validate(nextItem) === 'video') {
+      url = nextItem;
+      label = await resolveYoutubeDisplayLabel(nextItem);
+    } else {
+      const resolved = await resolveYoutubeFromQuery(nextItem);
+      url = resolved.url;
+      label = resolved.label;
+    }
+
+    await streamUrl(id, url, label);
+
+    /** Запомним что сейчас играет — нужно для toggleRepeat в середине трека. */
+    currentQueueItemByGuild.set(id, nextItem);
+
+    /** Повтор: не сдвигаем очередь — nextItem остаётся на queue[0] и сыграет снова. */
+    if (!repeatByGuild.has(id)) {
+      if (s.queue[0] === nextItem) {
+        s.queue.shift();
+      } else {
+        const ix = s.queue.indexOf(nextItem);
+        if (ix >= 0) s.queue.splice(ix, 1);
+      }
+    }
+  } catch (e) {
+    console.error('playNext', e);
+    s.playing = false;
+    killYtdlp(s);
+    /** При ошибке всегда сдвигаем — иначе зависший трек будет повторяться бесконечно. */
+    if (s.queue[0] === nextItem) {
+      s.queue.shift();
+    } else {
+      const ix = s.queue.indexOf(nextItem);
+      if (ix >= 0) s.queue.splice(ix, 1);
+    }
+    void queuePlayNext(id);
+  }
+}
+
+async function streamUrl(guildId, url, label) {
+  const id = String(guildId);
+
+  const s = guildState.get(id);
+  if (!s?.connection) {
+    throw new Error('Нет голосового соединения');
+  }
+  if (s.connection.state.status !== VoiceConnectionStatus.Ready) {
+    console.warn('[music] connection not Ready, waiting…', id);
+    await entersState(s.connection, VoiceConnectionStatus.Ready, 15_000);
+  }
+
+  killYtdlp(s);
+
+  const proc = createYoutubeStreamProcess(url);
+  /** Подавляем unhandledRejection: youtube-dl-exec возвращает thenable ChildProcess, и когда
+   *  мы убиваем его через killYtdlp, внутренний промис отклоняется с ChildProcessError(SIGKILL).
+   *  Нам это не нужно — SIGKILL намеренный. */
+  proc.catch?.(() => {});
+  s.ytdlp = proc;
+
+  proc.stderr?.on('data', (chunk) => {
+    const line = String(chunk);
+    if (line.includes('ERROR') || line.includes('error:')) {
+      console.error('[music] yt-dlp stderr', id, line.slice(0, 500));
+      /**
+       * Помечаем сбой стрима только для ТЕКУЩЕГО процесса.
+       * Ошибки Broken pipe / Invalid argument от предыдущего (убитого) процесса
+       * приходят на его же старый listener — у него s.ytdlp уже заменён новым proc,
+       * поэтому условие s.ytdlp === proc там ложное и флаг не ставится.
+       */
+      if (s.ytdlp === proc) {
+        s.ytdlpStreamError = true;
+      }
+    }
+  });
+
+  proc.on('error', (err) => {
+    console.error('[music] yt-dlp process error', id, err);
+  });
+
+  proc.on('close', (code) => {
+    if (s.ytdlp === proc) s.ytdlp = null;
+    if (code !== 0 && code !== null) {
+      console.warn('[music] yt-dlp exited', id, 'code', code);
+    }
+  });
+
+  if (!proc.stdout) {
+    killYtdlp(s);
+    throw new Error('yt-dlp не вернул поток (установи/обнови yt-dlp: npm i в папке бота или winget install yt-dlp)');
+  }
+
+  const resource = createAudioResource(proc.stdout, {
+    inputType: StreamType.Arbitrary,
+    metadata: { title: label },
+  });
+
+  const urlLeftForHistory = currentPlayingUrlByGuild.get(id);
+  const skipStackPush = suppressHistoryPushByGuild.has(id);
+  if (skipStackPush) suppressHistoryPushByGuild.delete(id);
+  /**
+   * Если skipStackPush (= навигация ⏮/⏭) — курсор оставляем: следующий ⏮/⏭ должен
+   * продолжить по той же сессии. При обычном новом треке (skip в середине, новый запрос
+   * через следующий queuePlayNext) — курсор сбрасываем, начинаем сессию заново.
+   */
+  if (!skipStackPush) {
+    idleNavCursorByGuild.delete(id);
+    idleBackForwardTailByGuild.delete(id);
+  }
+  /** Не класть в стек тот же URL (повтор после доигрывания) — иначе «назад» даёт дубликаты в очереди. */
+  if (!skipStackPush && urlLeftForHistory && urlLeftForHistory !== url) {
+    const stack = pastTrackUrlsByGuild.get(id) ?? [];
+    stack.push(urlLeftForHistory);
+    while (stack.length > PAST_TRACKS_CAP) stack.shift();
+    pastTrackUrlsByGuild.set(id, stack);
+  }
+
+  s.player.play(resource);
+  s.playing = true;
+  currentPlayingUrlByGuild.set(id, url);
+  currentPlayingLabelByGuild.set(id, String(label));
+  /** Не добавлять в историю сессии при навигации — иначе hist растёт и курсор сбивается. */
+  if (!skipStackPush) {
+    const sess = sessionPlayedWatchUrlsByGuild.get(id) ?? [];
+    if (sess.length === 0 || sess[sess.length - 1] !== url) {
+      sess.push(url);
+      while (sess.length > SESSION_PLAYED_CAP) sess.shift();
+      sessionPlayedWatchUrlsByGuild.set(id, sess);
+    }
+    console.log(`[session] guild=${id} sess=[${sess.map(u => '…' + u.slice(-8)).join(', ')}]`);
+    /** Копим все названия сессии для Groq-контекста автоплея (всегда, не только при ∞). */
+    const titles = autoplaySessionTitlesByGuild.get(id) ?? [];
+    // Санитизируем: оставляем только ASCII + кирилл + латиница + пробелы/пунктуация
+    const cleanTitle = String(label)
+      .replace(/[\u0000-\u001F\uFFFD]/g, '')   // control chars & replacement char
+      .replace(/[^\p{L}\p{N}\p{P}\p{Z}]/gu, ' ') // всё что не буква/цифра/пункт/пробел
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 120);
+    if (cleanTitle) titles.push(cleanTitle);
+    while (titles.length > AUTOPLAY_TITLES_CAP) titles.shift();
+    autoplaySessionTitlesByGuild.set(id, titles);
+  }
+  console.log(`[music] ${id} playing: ${label}`);
+  if (onPlayingTrackDisplay) {
+    try {
+      onPlayingTrackDisplay(id, String(label));
+    } catch (e) {
+      console.warn('[music] onPlayingTrackDisplay', e);
+    }
+  }
+}
+
+function truncateForPanelHint(s, max = 180) {
+  const t = String(s).trim();
+  if (t.length <= max) return t;
+  return `${t.slice(0, max - 1)}…`;
+}
+
+/**
+ * Для watch URL YouTube — заголовок ролика; иначе исходная строка (поисковый запрос и т.д.).
+ * @param {string} queryOrUrl
+ */
+export async function resolveYoutubeDisplayLabel(queryOrUrl) {
+  const raw = String(queryOrUrl).trim();
+  if (!raw) return raw;
+  if (play.yt_validate(raw) === 'video') {
+    try {
+      const info = await play.video_basic_info(raw);
+      const t = info.video_details?.title;
+      if (t && String(t).trim()) return String(t).trim();
+    } catch (e) {
+      console.warn('[music] video_basic_info', e);
+    }
+  }
+  return raw;
+}
+
+/**
+ * @param {import('discord.js').VoiceBasedChannel} channel
+ * @param {string} queryOrUrl
+ * @returns {Promise<{ panelHint: string, trackLabel: string }>}
+ */
+export async function enqueue(channel, queryOrUrl) {
+  const guildId = String(channel.guild.id);
+  const s = getState(guildId);
+  const joinedCh = s.connection?.joinConfig?.channelId;
+  const needNew =
+    !s.connection ||
+    String(joinedCh) !== String(channel.id) ||
+    s.connection.state.status === VoiceConnectionStatus.Destroyed;
+
+  if (needNew) {
+    s.connection?.destroy();
+    s.connection = joinVoiceChannel({
+      channelId: channel.id,
+      guildId,
+      adapterCreator: channel.guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+    });
+    s.connection.on('error', (e) => {
+      console.error('[music] VoiceConnection error', guildId, e);
+    });
+    try {
+      await entersState(s.connection, VoiceConnectionStatus.Ready, 30_000);
+    } catch (e) {
+      console.error('[music] voice not ready', guildId, e);
+      s.connection.destroy();
+      s.connection = null;
+      throw new Error('Не удалось подключиться к голосовому каналу');
+    }
+    s.connection.subscribe(s.player);
+  }
+
+  const raw = String(queryOrUrl);
+  idleNavCursorByGuild.delete(guildId);
+  idleBackForwardTailByGuild.delete(guildId);
+  /**
+   * Новая сессия: сбрасываем историю только если плеер действительно простаивает
+   * И при этом нет трека который только что доиграл (currentPlayingUrl = null означает
+   * свежий старт, не конец предыдущей сессии).
+   * Если currentPlayingUrl есть — продолжаем ту же сессию (добавляем к уже сыгранным).
+   */
+  if (s.queue.length === 0 && !s.playing && !currentPlayingUrlByGuild.has(guildId)) {
+    sessionPlayedWatchUrlsByGuild.delete(guildId);
+    pastTrackUrlsByGuild.delete(guildId);
+    currentQueueItemByGuild.delete(guildId);
+  }
+  s.queue.push(queryOrUrl);
+  if (!s.playing && s.queue.length === 1) {
+    await queuePlayNext(guildId);
+    const label =
+      currentPlayingLabelByGuild.get(guildId) ?? truncateForPanelHint(raw);
+    if (voiceClient) {
+      void checkVoiceChannelEmpty(channel.guild, getVoiceEmptyDelayMs());
+    }
+    return {
+      panelHint: `Сейчас играет: **${truncateForPanelHint(label)}**`,
+      trackLabel: String(label),
+    };
+  }
+
+  let tail = truncateForPanelHint(raw, 220);
+  const isVideoUrl = play.yt_validate(raw) === 'video';
+  if (isVideoUrl) {
+    try {
+      const titled = await resolveYoutubeDisplayLabel(raw);
+      if (titled && !/^https?:\/\//i.test(titled)) {
+        tail = truncateForPanelHint(titled, 220);
+      }
+    } catch { /* ignore */ }
+  } else {
+    /** Текстовый запрос — резолвим через ту же функцию что и queuePlayNext, чтобы название совпадало. */
+    try {
+      const resolved = await resolveYoutubeFromQuery(raw);
+      if (resolved?.label) tail = truncateForPanelHint(resolved.label, 220);
+    } catch { /* ignore — покажем raw query */ }
+  }
+  const panelHint = `В очереди: **${tail}**`;
+
+  if (voiceClient) {
+    void checkVoiceChannelEmpty(channel.guild, getVoiceEmptyDelayMs());
+  }
+
+  return { panelHint, trackLabel: tail };
+}
+
+/**
+ * Подборка по теме: ищет отдельные треки и ставит все в очередь воспроизведения.
+ * @param {import('discord.js').VoiceBasedChannel} channel
+ * @param {string} themeQuery
+ * @param {number} count
+ */
+export async function enqueuePlaylistByTheme(channel, themeQuery, count = 6) {
+  const items = await pickDistinctTrackVideos(themeQuery, count);
+  for (const it of items) {
+    await enqueue(channel, it.url);
+  }
+  return items;
+}
+
+/** Идёт воспроизведение (в т.ч. между треками до idle плеера). */
+export function isGuildPlayingMusic(guildId) {
+  if (guildId == null) return false;
+  const s = guildState.get(String(guildId));
+  return Boolean(s?.playing);
+}
+
+/**
+ * Состояние кнопок паузы: есть активный трек (очередь играет или на паузе) и флаг паузы плеера.
+ * @param {string | null | undefined} guildId
+ */
+export function getMusicTransportState(guildId) {
+  if (guildId == null) {
+    return {
+      hasActiveTrack: false,
+      paused: false,
+      canPrevious: false,
+      canSkipForward: false,
+      repeat: false,
+    };
+  }
+  const id = String(guildId);
+  const s = guildState.get(id);
+  if (!s?.player) {
+    return {
+      hasActiveTrack: false,
+      paused: false,
+      canPrevious: false,
+      canSkipForward: false,
+      repeat: false,
+    };
+  }
+  const st = s.player.state.status;
+  const paused =
+    st === AudioPlayerStatus.Paused || st === AudioPlayerStatus.AutoPaused;
+  const hasActiveTrack = Boolean(s.playing);
+  const stack = pastTrackUrlsByGuild.get(id) ?? [];
+  const curUrl = currentPlayingUrlByGuild.get(id);
+  const hasConn = Boolean(s.connection);
+  const endedAllState =
+    st === AudioPlayerStatus.Idle && !s.playing && s.queue.length === 0;
+  const sessionHist = sessionPlayedWatchUrlsByGuild.get(id) ?? [];
+  const rawCursor = idleNavCursorByGuild.get(id);
+  /** Стартовая позиция = hist.length (виртуально «после последнего»), первый ⏮ даёт hist[length-1] — сам последний трек. */
+  const curCursor = rawCursor != null ? rawCursor : sessionHist.length;
+  const sessionCanBack = endedAllState && curCursor > 0;
+  /** Живой плеер: past stack. После доигрывания всего — cursor по sessionPlayedWatchUrls. */
+  const topPrev = stack.length > 0 ? stack[stack.length - 1] : null;
+  const stackHasRealPrevious =
+    topPrev != null && curUrl != null && topPrev !== curUrl;
+  const canPrevious =
+    hasConn &&
+    Boolean(curUrl) &&
+    (endedAllState ? sessionCanBack : stackHasRealPrevious);
+  const canSkipForward =
+    hasActiveTrack || idleBackForwardTailByGuild.has(id);
+  const repeat = repeatByGuild.has(id);
+  const autoplay = autoplayByGuild.has(id);
+  return { hasActiveTrack, paused, canPrevious, canSkipForward, repeat, autoplay };
+}
+
+/** Пауза текущего трека (если играет). */
+export function pauseMusic(guildId) {
+  if (guildId == null) return false;
+  const s = guildState.get(String(guildId));
+  if (!s?.playing || !s.player) return false;
+  const st = s.player.state.status;
+  if (st === AudioPlayerStatus.Idle) return false;
+  if (st === AudioPlayerStatus.Paused || st === AudioPlayerStatus.AutoPaused) return false;
+  return s.player.pause(true);
+}
+
+/** Снять паузу. */
+export function resumeMusic(guildId) {
+  if (guildId == null) return false;
+  const s = guildState.get(String(guildId));
+  if (!s?.player || !s.playing) return false;
+  const st = s.player.state.status;
+  if (st !== AudioPlayerStatus.Paused && st !== AudioPlayerStatus.AutoPaused) return false;
+  return s.player.unpause();
+}
+
+/**
+ * Предыдущий трек: только из стека проигранных URL; без стека — false (в т.ч. после доигрывания всей очереди).
+ * @returns {boolean} удалось начать переключение
+ */
+export function previousTrack(guildId) {
+  if (guildId == null) return false;
+  const id = String(guildId);
+  const s = guildState.get(id);
+  if (!s?.connection) return false;
+  const st = s.player.state.status;
+  const cur = currentPlayingUrlByGuild.get(id);
+  if (!cur) return false;
+
+  const playingOrPaused =
+    st === AudioPlayerStatus.Playing ||
+    st === AudioPlayerStatus.Paused ||
+    st === AudioPlayerStatus.AutoPaused ||
+    st === AudioPlayerStatus.Buffering;
+
+  const endedAll =
+    st === AudioPlayerStatus.Idle && !s.playing && s.queue.length === 0;
+
+  /** Повтор включён + трек активен → перезапустить текущий трек вместо перехода назад. */
+  if (repeatByGuild.has(id) && playingOrPaused) {
+    suppressHistoryPushByGuild.add(id);
+    killYtdlp(s);
+    s.player.stop(true);
+    return true;
+  }
+
+  const stack = pastTrackUrlsByGuild.get(id) ?? [];
+
+  if (endedAll) {
+    const hist = sessionPlayedWatchUrlsByGuild.get(id) ?? [];
+    if (hist.length < 1) return false;
+    /**
+     * Курсор: начинаем с конца hist (последний доигранный).
+     * Каждый ⏮ двигает курсор на -1.
+     * Курсор указывает на «текущий» в idle-навигации.
+     * «Предыдущий» = cursor - 1.
+     */
+    const rawCursor = idleNavCursorByGuild.get(id);
+    /** Стартовая позиция = hist.length (после последнего), первый ⏮ → hist[length-1] = последний трек. */
+    const curCursor = rawCursor != null ? rawCursor : hist.length;
+    const prevCursor = curCursor - 1;
+    if (prevCursor < 0) return false;
+    const prevUrl = hist[prevCursor];
+    if (!prevUrl) return false;
+    idleNavCursorByGuild.set(id, prevCursor);
+    idleBackForwardTailByGuild.set(id, hist[curCursor] ?? cur);
+    /**
+     * Синхронизируем живой стек: после idle-nav cursor=prevCursor,
+     * «предыдущих» в live-режиме будут все треки до prevCursor.
+     * Иначе при ⏮ во время воспроизведения nav-трека stack.pop() даст
+     * тот же URL что cur → кнопка блокируется.
+     */
+    pastTrackUrlsByGuild.set(id, hist.slice(0, prevCursor));
+    s.queue.unshift(prevUrl);
+    suppressHistoryPushByGuild.add(id);
+    console.log(`[prev/idle] hist=[${hist.map(u => '…' + u.slice(-8)).join(', ')}] cursor ${curCursor}->${prevCursor} prevUrl=…${prevUrl.slice(-11)}`);
+    void queuePlayNext(id);
+    return true;
+  }
+
+  if (!playingOrPaused) return false;
+  if (stack.length === 0) return false;
+
+  idleBackForwardTailByGuild.delete(id);
+
+  const prevUrl = stack.pop();
+  if (!prevUrl) return false;
+  if (prevUrl === cur) {
+    stack.push(prevUrl);
+    if (stack.length === 0) pastTrackUrlsByGuild.delete(id);
+    else pastTrackUrlsByGuild.set(id, stack);
+    return false;
+  }
+  if (stack.length === 0) pastTrackUrlsByGuild.delete(id);
+  else pastTrackUrlsByGuild.set(id, stack);
+
+  /**
+   * Если repeat был включён, текущий трек не сдвигался и сидит на queue[0] как исходный
+   * queryOrUrl. При добавлении cur (resolved URL) поверх него получаем два вхождения
+   * одного трека. Убираем оригинальный элемент с queue[0] перед вставкой.
+   */
+  const currentOrigItem = currentQueueItemByGuild.get(id);
+  if (currentOrigItem && s.queue[0] === currentOrigItem) {
+    s.queue.shift();
+  }
+  s.queue.unshift(cur);
+  s.queue.unshift(prevUrl);
+  const sess = sessionPlayedWatchUrlsByGuild.get(id);
+  if (sess && sess.length > 0 && sess[sess.length - 1] === cur) {
+    sess.pop();
+    sessionPlayedWatchUrlsByGuild.set(id, sess);
+  }
+  suppressHistoryPushByGuild.add(id);
+  killYtdlp(s);
+  s.player.stop(true);
+  return true;
+}
+
+export function skip(guildId) {
+  if (guildId == null) return false;
+  const id = String(guildId);
+  const s = guildState.get(id);
+  if (!s?.player) return false;
+  /**
+   * Если repeat включён, текущий трек не был сдвинут и сидит на queue[0].
+   * При скипе надо его явно убрать, иначе после stop() Idle запустит его снова.
+   */
+  if (repeatByGuild.has(id) && s.queue.length > 0) {
+    s.queue.shift();
+  }
+  const tail = idleBackForwardTailByGuild.get(id);
+  if (tail) {
+    const hist = sessionPlayedWatchUrlsByGuild.get(id) ?? [];
+    const cursor = idleNavCursorByGuild.get(id);
+    if (cursor != null) {
+      const nextCursor = cursor + 1;
+      if (nextCursor < hist.length) {
+        idleNavCursorByGuild.set(id, nextCursor);
+        idleBackForwardTailByGuild.set(id, hist[nextCursor]);
+      } else {
+        idleNavCursorByGuild.delete(id);
+        idleBackForwardTailByGuild.delete(id);
+      }
+    } else {
+      idleBackForwardTailByGuild.delete(id);
+    }
+    suppressHistoryPushByGuild.add(id);
+    s.queue.unshift(tail);
+  }
+  killYtdlp(s);
+  s.player.stop(true);
+  return true;
+}
+
+export function stopAndLeave(guildId) {
+  if (guildId == null) return;
+  const id = String(guildId);
+  pastTrackUrlsByGuild.delete(id);
+  sessionPlayedWatchUrlsByGuild.delete(id);
+  suppressHistoryPushByGuild.delete(id);
+  idleNavCursorByGuild.delete(id);
+  idleBackForwardTailByGuild.delete(id);
+  repeatByGuild.delete(id);
+  autoplayByGuild.delete(id);
+  autoplaySeedQueryByGuild.delete(id);
+  autoplaySessionTitlesByGuild.delete(id);
+  currentQueueItemByGuild.delete(id);
+  currentPlayingUrlByGuild.delete(id);
+  currentPlayingLabelByGuild.delete(id);
+  clearVoiceEmptyTimer(id);
+  const s = guildState.get(id);
+  if (s) {
+    s.queue.length = 0;
+    s.playing = false;
+    killYtdlp(s);
+    s.player.stop(true);
+    s.connection?.destroy();
+    s.connection = null;
+  }
+  // Всегда чистим UI (панель + список), даже если состояние плеера уже отсутствует.
+  if (onMusicForceStop) onMusicForceStop(id);
+}
