@@ -15,6 +15,7 @@
 | [ИНВАРИАНТЫ.md](ИНВАРИАНТЫ.md) | Критичные правила для разработчиков: планировщик, prefetch, stale guard, FSM |
 | [БАГИ.md](БАГИ.md) | Реестр багов (история + открытые) |
 | [ПЛАН-РЕФАКТОРИНГА.md](ПЛАН-РЕФАКТОРИНГА.md) | Целевая архитектура доменного слоя, порядок шагов, согласованные контракты |
+| [adr/001-data-layer.md](adr/001-data-layer.md) | ADR-001: data layer — один `DATABASE_URL`, Drizzle, SQLite для dev/test, Postgres как upgrade path, test-safety invariant, migration ownership, cross-backend discipline, fail-policy |
 
 ---
 
