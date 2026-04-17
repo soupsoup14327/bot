@@ -537,16 +537,20 @@ export function isGuildPlayingMusic(guildId) {
  *   - canSkipForward — (playing ‖ paused) && (очередь / ∞ / idle-tail). На
  *     паузе skip авто-resume'ит через playNext после stopPlayer → Idle.
  *
- *   - canRepeatToggle — ТОЛЬКО при активном треке (playing/paused). Семантика
- *     «повтори этот трек» требует контекста трека; без него toggle — шум для
- *     UX (пользователь смотрит на подсвеченную кнопку и не понимает что она
- *     делает). В IDLE_EMPTY/IDLE_EXHAUSTED/LOADING — disabled.
+ *   - canRepeatToggle / canAutoplayToggle — ТОЛЬКО при активном треке
+ *     (playing/paused). Симметрия: оба тоггла — про поведение «прямо сейчас»,
+ *     без контекста играющего трека они семантический шум (юзер видит
+ *     подсвеченную кнопку, но не понимает что она делает).
  *
- *   - canAutoplayToggle — playing/paused ИЛИ IDLE_EXHAUSTED в войсе.
- *     IDLE_EXHAUSTED имеет осмысленный pre-arm: «только что доиграл — ∞ ON →
- *     продолжи станцию одним кликом». В IDLE_EMPTY (только что зашли в войс,
- *     никогда ничего не играло) pre-arm бесполезен — всё равно /play нужен,
- *     после старта можно включить ∞.
+ *     Почему НЕ держим pre-arm в IDLE_EXHAUSTED для ∞:
+ *       1. Апликейшн с рекомендатором (планируется) заменит autoplay-toggle
+ *          на «always-on radio preview», и continue-station как отдельное
+ *          действие исчезнет — витрина Up-Next сразу видна.
+ *       2. Текущий youtube-related автоподбор не знает истории/лайков, и
+ *          продолжение станции одним кликом часто даёт нерелевантный трек
+ *          (тот же seed, те же проблемы что до IDLE_EXHAUSTED).
+ *     Итого: сейчас вариант B (симметрия с repeat), рекомендатор прилетит
+ *     отдельным UX-апдейтом.
  *
  *   - canLike — enabled когда hasActiveTrack ИЛИ IDLE_EXHAUSTED + в
  *     currentPlayingLabelByGuild ещё помнится последний трек («ретроспективный
@@ -600,14 +604,9 @@ export function getMusicTransportState(guildId) {
       getIdleBackForwardTail(id) != null
     );
 
-  // ↻ repeat — только при активном треке (нет смысла без контекста).
-  // ∞ autoplay — активный трек ИЛИ IDLE_EXHAUSTED в войсе (pre-arm
-  // «продолжи станцию» после доигрывания). См. доку выше про семантику.
+  // Оба тоггла симметричны: только при активном треке. См. доку выше.
   const canRepeatToggle = (playing || paused) && inVoice && !loading;
-  const canAutoplayToggle =
-    !loading &&
-    inVoice &&
-    (playing || paused || playerState === PlayerState.IDLE_EXHAUSTED);
+  const canAutoplayToggle = (playing || paused) && inVoice && !loading;
 
   // Ретроспективный лайк: IDLE_EXHAUSTED пока currentPlayingLabelByGuild
   // ещё помнит последний трек (до stopAndLeave полного teardown'а).

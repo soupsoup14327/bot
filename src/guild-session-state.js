@@ -68,11 +68,39 @@ export function getSessionId(guildId) {
 }
 
 /**
- * End session on stopAndLeave or voice timeout.
+ * End the playback session for a guild.
+ *
+ * Clears ALL voice-scoped runtime state — session id + "currently playing"
+ * metadata maps. This is intentional: the semantics of a session ending
+ * are "the voice context is gone, nothing is playing anymore". Leaving
+ * `currentPlayingLabelByGuild` or `currentPlayingUrlByGuild` populated
+ * after session end would surface as stale labels in `getGuildSessionSnapshot`
+ * (e.g. the retrospective-like path reading a label from a session that
+ * already ended).
+ *
+ * Idempotent: safe to call after `stopAndLeave` has already cleared the
+ * same maps — all `.delete` ops are no-ops on missing keys.
+ *
+ * Paths that reach here:
+ *   - `commands.stopAndLeave` → `stop-and-leave-steps` clears maps →
+ *     voice-adapter.leave() → `onVoiceGone` → `endSession` (redundant clear, ok)
+ *   - Auto-leave timer → same chain as above.
+ *   - User drags bot out manually → voice-adapter detects disconnect →
+ *     `onVoiceGone` → `endSession` (FIRST clear happens here — the
+ *     `stopAndLeave` cleanup path didn't run in this scenario).
+ *
+ * NOTE: preserves `repeatByGuild` / `autoplayByGuild` — those are user
+ * preferences that should survive a voice-gone (user comes back and expects
+ * their toggles to still be as they left them).
+ *
  * @param {string} guildId
  */
 export function endSession(guildId) {
-  sessionIdByGuild.delete(String(guildId));
+  const id = String(guildId);
+  sessionIdByGuild.delete(id);
+  currentPlayingUrlByGuild.delete(id);
+  currentPlayingLabelByGuild.delete(id);
+  currentQueueItemByGuild.delete(id);
 }
 
 // ─── Listeners count (updated via voiceStateUpdate in index.js) ───────────────
