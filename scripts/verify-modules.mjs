@@ -506,18 +506,18 @@ async function smokePureFunctions() {
     assert(typeof orch.commands[k] === 'function', `orchestrator.commands.${k} должен быть функцией`);
   }
   assert(Object.isFrozen(orch.commands), 'orchestrator.commands заморожен');
-  const rNullSkip = orch.commands.skip(null);
+  const rNullSkip = await orch.commands.skip(null);
   assert(rNullSkip.ok === false && rNullSkip.code === 'invalid_argument', 'commands.skip(null) → invalid_argument');
-  const rNullStop = orch.commands.stopAndLeave(null);
+  const rNullStop = await orch.commands.stopAndLeave(null);
   assert(rNullStop.ok === false && rNullStop.code === 'invalid_argument', 'commands.stopAndLeave(null) → invalid_argument');
   const rBadEnqueue = await orch.commands.enqueue(null);
   assert(rBadEnqueue.ok === false && rBadEnqueue.code === 'invalid_argument', 'commands.enqueue(null) → invalid_argument');
   const freshToggleGuild = `smoke-orch-toggle-${Date.now()}`;
-  const rToggle1 = orch.commands.toggleRepeat(freshToggleGuild);
+  const rToggle1 = await orch.commands.toggleRepeat(freshToggleGuild);
   assert(rToggle1.ok === true && rToggle1.value.enabled === true, 'commands.toggleRepeat первый раз → enabled=true');
-  const rToggle2 = orch.commands.toggleRepeat(freshToggleGuild);
+  const rToggle2 = await orch.commands.toggleRepeat(freshToggleGuild);
   assert(rToggle2.ok === true && rToggle2.value.enabled === false, 'commands.toggleRepeat второй раз → enabled=false');
-  const rStopOk = orch.commands.stopAndLeave(freshToggleGuild);
+  const rStopOk = await orch.commands.stopAndLeave(freshToggleGuild);
   assert(rStopOk.ok === true, 'commands.stopAndLeave живой guildId → Ok');
   tests.push('orchestrator.commands shape');
 
