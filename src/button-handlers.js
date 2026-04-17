@@ -50,7 +50,7 @@ export async function handleButtonInteractions(interaction) {
       const res = await orchestrator.commands.previousTrack(interaction.guildId, interaction.user.id);
       if (!res.ok) {
         await interaction.followUp({
-          content: 'Назад некуда — это первый трек в этой сессии или плеер сейчас не активен.',
+          content: 'Назад некуда - это первый трек в этой сессии или плеер сейчас не активен.',
           flags: MessageFlags.Ephemeral,
         }).catch(() => {});
       }
@@ -94,15 +94,15 @@ export async function handleButtonInteractions(interaction) {
     case BTN_LIKE: {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const guildId = interaction.guildId;
-      const userId  = interaction.user.id;
+      const userId = interaction.user.id;
       const snapshot = guildId ? getGuildSessionSnapshot(guildId) : null;
       if (!snapshot?.currentUrl) {
         await interaction.editReply({ content: 'Сейчас ничего не играет.' });
         break;
       }
-      // personal-signals.js — stub до появления БД. emitLike возвращает
-      // { ok:false, reason:'not_implemented' } — показываем честную ошибку,
-      // чтобы не плодить временный UX «успех без персистентности».
+
+      // personal-signals.js now delegates to a DB-backed likes service while
+      // keeping the stable `{ ok, removed | reason }` seam for this UI branch.
       try {
         const res = await emitLike({
           userId,
@@ -116,12 +116,12 @@ export async function handleButtonInteractions(interaction) {
           await interaction.editReply({ content: head });
         } else {
           await interaction.editReply({
-            content: 'Избранное пока не работает — ждём БД приложения.',
+            content: 'Не удалось сохранить избранное - попробуй еще раз.',
           });
         }
       } catch (err) {
         console.error('[like] failed', err);
-        await interaction.editReply({ content: 'Не удалось сохранить — попробуй ещё раз.' });
+        await interaction.editReply({ content: 'Не удалось сохранить - попробуй еще раз.' });
       }
       break;
     }

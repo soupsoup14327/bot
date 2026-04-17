@@ -32,6 +32,7 @@ const commands = [
       o.setName('query').setDescription('Запрос или ссылка').setRequired(true),
     )
     .toJSON(),
+  new SlashCommandBuilder().setName('likes').setDescription('Показать избранные треки').toJSON(),
   new SlashCommandBuilder().setName('skip').setDescription('Следующий трек').toJSON(),
   new SlashCommandBuilder().setName('stop').setDescription('Остановить и выйти из войса').toJSON(),
 ];

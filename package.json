@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test",
-    "test:watch": "node --test --watch",
-    "verify": "node scripts/verify-modules.mjs && node scripts/generate-env-example.mjs --check && node scripts/verify-env.mjs && node --test",
+    "test": "node --import ./test/setup.js --test test/*.test.js",
+    "test:watch": "node --import ./test/setup.js --test --watch test/*.test.js",
+    "verify": "node scripts/verify-modules.mjs && node scripts/generate-env-example.mjs --check && node scripts/verify-env.mjs && node --import ./test/setup.js --test test/*.test.js",
     "verify:env": "node scripts/generate-env-example.mjs --check && node scripts/verify-env.mjs",
     "env:example": "node scripts/generate-env-example.mjs",
     "env:example:check": "node scripts/generate-env-example.mjs --check",
@@ -15,6 +15,10 @@
     "env:doctor": "node scripts/env-easy.mjs doctor",
     "env:preset:stable": "node scripts/env-easy.mjs preset stable",
     "env:preset:conservative": "node scripts/env-easy.mjs preset conservative",
+    "db:generate": "npm run db:generate:sqlite && npm run db:generate:pg",
+    "db:generate:sqlite": "drizzle-kit generate --config drizzle.config.ts",
+    "db:generate:pg": "drizzle-kit generate --config drizzle.pg.config.ts",
+    "db:migrate": "node src/db/migrate.js",
     "kill-bots": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/kill-bot-instances.ps1",
     "register-commands": "node src/register-commands.js",
     "postinstall": "node -e \"require('fs').copyFileSync('node_modules/libsodium/dist/modules-esm/libsodium.mjs','node_modules/libsodium-wrappers/dist/modules-esm/libsodium.mjs')\""
@@ -24,12 +28,18 @@
   },
   "dependencies": {
     "@discordjs/voice": "^0.19.2",
+    "better-sqlite3": "^12.9.0",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.7",
+    "drizzle-orm": "^0.45.2",
     "ffmpeg-static": "^5.2.0",
     "libsodium": "^0.7.16",
     "libsodium-wrappers": "^0.7.16",
+    "pg": "^8.20.0",
     "play-dl": "^1.9.7",
     "youtube-dl-exec": "^3.1.5"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.10"
   }
 }

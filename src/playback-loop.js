@@ -52,6 +52,7 @@ import {
   logStreamEnd,
 } from './playback-metrics.js';
 import { createStream as createAudioStream } from './audio-pipeline.js';
+import { recordPlaybackHistory } from './playback-history.js';
 import {
   baselineAutoplaySpawnBegin,
   baselineAutoplaySpawnEnd,
@@ -246,6 +247,16 @@ function handlePlayerIdle(id) {
     const finUrl = currentPlayingUrlByGuild.get(id) ?? '';
     const finTitle = currentPlayingLabelByGuild.get(id) ?? '';
     const finItem = currentQueueItemByGuild.get(id);
+    void recordPlaybackHistory({
+      eventType: 'finished',
+      guildId: id,
+      sessionId: getSessionId(id),
+      requestedBy: finItem?.requestedBy ?? null,
+      triggeredBy: sourceToTriggeredBy(finItem?.source),
+      listenersCount: getListenersCount(id),
+      url: finUrl,
+      title: finTitle,
+    });
     void emitSignal('track_finished', {
       guildId: id,
       sessionId: getSessionId(id),

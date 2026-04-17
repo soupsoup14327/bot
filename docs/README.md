@@ -1,7 +1,7 @@
 # Документация PAWPAW
 
 **Язык документации:** русский  
-**Обновлено:** 2026-04-17
+**Обновлено:** 2026-04-18
 
 ---
 
@@ -35,10 +35,18 @@ npm start
 npm run verify
 ```
 
+**Что делать после правки `src/db/schema.js`?**
+```bash
+npm run db:generate
+```
+
 **Как зарегистрировать slash-команды?**
 ```bash
 npm run register-commands
 ```
+
+**Как посмотреть избранные треки?**
+→ `/likes`
 
 **Где смотреть метрики?**
 → `bot/data/metrics/*.txt` (при `METRICS_TXT_ENABLED=1`)
@@ -54,3 +62,6 @@ npm run register-commands
 
 **Что нельзя делать в `runPlayNext`?**
 → `docs/ИНВАРИАНТЫ.md` → раздел 1
+
+**Где смотреть текущий data layer и history foundation?**
+→ `docs/АРХИТЕКТУРА.md` → «База данных» и `docs/adr/001-data-layer.md`

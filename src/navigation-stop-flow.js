@@ -31,6 +31,8 @@ export function logSkipIdleTailOutcome(guildId, result) {
  *   currentPlayingLabelByGuild: Map<string, string>,
  *   currentQueueItemByGuild: Map<string, { source?: string, requestedBy?: string | null }>,
  *   emitSignal: (signalName: string, payload: Record<string, unknown>) => Promise<void> | void,
+ *   recordPlaybackHistory?: (payload: Record<string, unknown>) => Promise<unknown> | void,
+ *   sourceToTriggeredBy?: (source: string | null | undefined) => string,
  *   markSuppressTrackFinishedOnce: (guildId: string) => void,
  *   killYtdlp: (s: any) => void,
  *   stopPlayer: (guildId: string) => void,
@@ -40,6 +42,19 @@ export function stopWithNavigationSignal(p) {
   const url = p.currentPlayingUrlByGuild.get(p.guildId) ?? '';
   const title = p.currentPlayingLabelByGuild.get(p.guildId) ?? '';
   const item = p.currentQueueItemByGuild.get(p.guildId);
+  if (p.recordPlaybackHistory) {
+    void p.recordPlaybackHistory({
+      eventType: p.signalName === 'track_previous' ? 'previous' : 'skipped',
+      guildId: p.guildId,
+      sessionId: p.sessionId ?? null,
+      actor: p.actor ?? null,
+      requestedBy: item?.requestedBy ?? null,
+      triggeredBy: p.sourceToTriggeredBy ? p.sourceToTriggeredBy(item?.source) : 'navigation',
+      listenersCount: p.listenersCount ?? 0,
+      url,
+      title,
+    });
+  }
   void p.emitSignal(p.signalName, {
     guildId: p.guildId,
     sessionId: p.sessionId ?? null,

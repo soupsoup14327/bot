@@ -66,6 +66,7 @@ function groupRegistry() {
   const groups = new Map();
   for (const c of CATEGORY_ORDER) groups.set(c, []);
   for (const row of ENV_REGISTRY) {
+    if (row.name === 'DATABASE_URL') continue;
     if (!groups.has(row.category)) groups.set(row.category, []);
     groups.get(row.category).push(row);
   }

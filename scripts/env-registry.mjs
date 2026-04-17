@@ -1,4 +1,4 @@
-export const INTERNAL_ENV_KEYS = new Set(['FFMPEG_PATH']);
+export const INTERNAL_ENV_KEYS = new Set(['FFMPEG_PATH', 'NODE_ENV']);
 
 /**
  * Central source of truth for runtime env vars.
@@ -10,6 +10,8 @@ export const ENV_REGISTRY = [
   { name: 'DISCORD_CLIENT_ID', category: 'core', type: 'string', required: false, description: 'Application ID for slash command registration.' },
   { name: 'DISCORD_GUILD_ID', category: 'core', type: 'string', required: false, description: 'Guild id or comma-separated guild ids for fast command sync.' },
   { name: 'DISCORD_KEEP_GLOBAL_COMMANDS', category: 'core', type: 'bool01', defaultValue: '0', required: false, description: 'Keep global slash commands when guild-scoped registration is enabled.' },
+  { name: 'DATABASE_URL', category: 'core', type: 'string', required: false, description: 'Unified data-layer backend URL. See ADR-001 and the dedicated .env.example block.' },
+  { name: 'TRACK_PLAYS_RETENTION_PER_USER', category: 'core', type: 'int', min: 0, max: 100000, defaultValue: '500', required: false, description: 'Keep only the newest N playback-history rows per user. 0 disables pruning.' },
 
   // Metrics and observability
   { name: 'METRICS_TXT_ENABLED', category: 'metrics', type: 'bool01', defaultValue: '1', required: false, description: 'Enable metrics writes to data/metrics/*.txt.' },

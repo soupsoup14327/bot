@@ -99,6 +99,7 @@ import {
   emitSignal,
   sourceToTriggeredBy,
 } from './music-signals.js';
+import { recordPlaybackHistory } from './playback-history.js';
 import { resetPlaybackMetricsSession } from './playback-metrics.js';
 import { sameYoutubeContent } from './queue-invariants.js';
 import {
@@ -281,6 +282,8 @@ export function skip(guildId, actorUserId = null) {
     currentPlayingLabelByGuild,
     currentQueueItemByGuild,
     emitSignal,
+    recordPlaybackHistory,
+    sourceToTriggeredBy,
     markSuppressTrackFinishedOnce,
     killYtdlp,
     stopPlayer,
@@ -343,6 +346,8 @@ export function previousTrack(guildId, actorUserId = null) {
       currentPlayingLabelByGuild,
       currentQueueItemByGuild,
       emitSignal,
+      recordPlaybackHistory,
+      sourceToTriggeredBy,
       markSuppressTrackFinishedOnce,
       killYtdlp,
       stopPlayer,

@@ -14,7 +14,7 @@
  *   3. Регистрирует callback'и voice-adapter → orchestrator.events + auto-leave.
  *   4. Слушает `voiceStateUpdate` и обновляет listeners-count в session-state.
  *   5. Маршрутизирует:
- *       - slash-команды /chat /image /play /skip /stop,
+ *       - slash-команды /chat /image /play /likes /skip /stop,
  *       - кнопки музыкальной панели → button-handlers,
  *       - модальное окно /play (через кнопку «+ добавить») → music.enqueue.
  *
@@ -34,7 +34,10 @@ import {
 } from 'discord.js';
 import sodium from 'libsodium-wrappers';
 
+import { openDatabaseConnection } from './db/connection.js';
+import { runDatabaseMigrations } from './db/migrate.js';
 import { chatGroq } from './groq.js';
+import { buildLikesReply } from './likes-ui.js';
 import { registerAutoplayUserQuery } from './music.js';
 import { orchestrator } from './orchestrator.js';
 import {
@@ -47,6 +50,7 @@ import {
   registerVoiceAdapterCallbacks,
 } from './voice-adapter.js';
 import { handleButtonInteractions } from './button-handlers.js';
+import { listLikes } from './personal-signals.js';
 import { FIELD_PLAY_QUERY, MODAL_PLAY } from './ui-components.js';
 import { updateListenersCount } from './guild-session-state.js';
 import { formatSingleQueueLine } from './queue-line-format.js';
@@ -60,6 +64,29 @@ const SYSTEM =
 const token = process.env.DISCORD_TOKEN;
 if (!token) {
   console.error('Создай файл .env с DISCORD_TOKEN=... (см. .env.example)');
+  process.exit(1);
+}
+
+/**
+ * Startup DB barrier from ADR-001 §5.3:
+ * env -> open/guard -> migrate -> login.
+ *
+ * If schema prep fails, the bot must not connect to Discord at all.
+ */
+async function ensureDatabaseReadyForStartup() {
+  const connection = await openDatabaseConnection();
+  try {
+    await runDatabaseMigrations({ connection });
+    console.log(`[db] ready backend=${connection.backend}`);
+  } finally {
+    await connection.close();
+  }
+}
+
+try {
+  await ensureDatabaseReadyForStartup();
+} catch (error) {
+  console.error('[startup] database init failed', error);
   process.exit(1);
 }
 
@@ -281,6 +308,15 @@ client.on('interactionCreate', async (interaction) => {
         console.error('[slash /play]', err);
         await replyErrorEphemeral(interaction, err);
       }
+      return;
+    }
+
+    if (interaction.commandName === 'likes') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const likes = await listLikes(interaction.user.id, { limit: 10 });
+      await interaction.editReply({
+        content: buildLikesReply(likes, { limit: 10 }),
+      });
       return;
     }
 
