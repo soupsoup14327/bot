@@ -24,7 +24,23 @@ export const FIELD_PLAY_QUERY = 'play_query';
 
 /**
  * Строка 1: ⏮ ▶/⏸ ⏭ ↻ ∞ (транспорт). Строка 2: остановить, + добавить, ❤.
- * @param {{ hasActiveTrack: boolean, paused: boolean, canPrevious: boolean, canSkipForward: boolean, repeat: boolean, autoplay: boolean, loading?: boolean }} opts
+ *
+ * Все «can*» флаги вычисляются ВЫШЕ, в `music.js::getMusicTransportState` —
+ * этот модуль только переводит их в disabled/style. Никакой логики состояний
+ * здесь быть не должно.
+ *
+ * @param {{
+ *   hasActiveTrack: boolean,
+ *   paused: boolean,
+ *   canPrevious: boolean,
+ *   canSkipForward: boolean,
+ *   canRepeatToggle: boolean,
+ *   canAutoplayToggle: boolean,
+ *   canLike: boolean,
+ *   repeat: boolean,
+ *   autoplay: boolean,
+ *   loading?: boolean,
+ * }} opts
  * @returns {import('discord.js').ActionRowBuilder[]}
  */
 export function buildMusicControlRows({
@@ -32,6 +48,9 @@ export function buildMusicControlRows({
   paused,
   canPrevious,
   canSkipForward,
+  canRepeatToggle,
+  canAutoplayToggle,
+  canLike,
   repeat,
   autoplay,
   loading = false,
@@ -60,19 +79,19 @@ export function buildMusicControlRows({
       .setDisabled(true);
   }
 
-  /** Кнопка повтора: серая — выкл, фиолетовая — вкл, неактивна когда ничего не играет. */
+  /** Кнопка повтора: серая — выкл, фиолетовая — вкл. Pre-arm toggle. */
   const repeatBtn = new ButtonBuilder()
     .setCustomId(BTN_REPEAT)
     .setLabel('↻')
     .setStyle(repeat ? ButtonStyle.Primary : ButtonStyle.Secondary)
-    .setDisabled(!hasActiveTrack);
+    .setDisabled(!canRepeatToggle);
 
-  /** Кнопка автоплея: серая — выкл, фиолетовая — вкл, неактивна когда ничего не играет. */
+  /** Кнопка автоплея: серая — выкл, фиолетовая — вкл. Pre-arm toggle. */
   const autoplayBtn = new ButtonBuilder()
     .setCustomId(BTN_AUTOPLAY)
     .setLabel('∞')
     .setStyle(autoplay ? ButtonStyle.Primary : ButtonStyle.Secondary)
-    .setDisabled(!hasActiveTrack);
+    .setDisabled(!canAutoplayToggle);
 
   const transport = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -96,7 +115,7 @@ export function buildMusicControlRows({
       .setCustomId(BTN_LIKE)
       .setLabel('❤')
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(!hasActiveTrack),
+      .setDisabled(!canLike),
   );
   return [transport, main];
 }

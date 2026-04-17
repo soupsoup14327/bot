@@ -74,29 +74,29 @@ describe('orchestrator.commands Result contract (Шаг 7)', () => {
     assert.equal(/** @type {any} */ (res).code, expectedCode);
   }
 
-  test('skip(null) → Err invalid_argument', () => {
-    assertErr(commands.skip(null), 'invalid_argument');
-    assertErr(commands.skip(undefined), 'invalid_argument');
-    assertErr(commands.skip(''), 'invalid_argument');
+  test('skip(null) → Err invalid_argument', async () => {
+    assertErr(await commands.skip(null), 'invalid_argument');
+    assertErr(await commands.skip(undefined), 'invalid_argument');
+    assertErr(await commands.skip(''), 'invalid_argument');
   });
 
-  test('previousTrack(null) → Err invalid_argument', () => {
-    assertErr(commands.previousTrack(null), 'invalid_argument');
-    assertErr(commands.previousTrack(undefined), 'invalid_argument');
+  test('previousTrack(null) → Err invalid_argument', async () => {
+    assertErr(await commands.previousTrack(null), 'invalid_argument');
+    assertErr(await commands.previousTrack(undefined), 'invalid_argument');
   });
 
-  test('pause(null) / resume(null) → Err invalid_argument', () => {
-    assertErr(commands.pause(null), 'invalid_argument');
-    assertErr(commands.resume(undefined), 'invalid_argument');
+  test('pause(null) / resume(null) → Err invalid_argument', async () => {
+    assertErr(await commands.pause(null), 'invalid_argument');
+    assertErr(await commands.resume(undefined), 'invalid_argument');
   });
 
-  test('toggleRepeat(null) / toggleAutoplay(null) → Err invalid_argument', () => {
-    assertErr(commands.toggleRepeat(null), 'invalid_argument');
-    assertErr(commands.toggleAutoplay(null), 'invalid_argument');
+  test('toggleRepeat(null) / toggleAutoplay(null) → Err invalid_argument', async () => {
+    assertErr(await commands.toggleRepeat(null), 'invalid_argument');
+    assertErr(await commands.toggleAutoplay(null), 'invalid_argument');
   });
 
-  test('stopAndLeave(null) → Err invalid_argument', () => {
-    assertErr(commands.stopAndLeave(null), 'invalid_argument');
+  test('stopAndLeave(null) → Err invalid_argument', async () => {
+    assertErr(await commands.stopAndLeave(null), 'invalid_argument');
   });
 
   test('enqueue без channel → Err invalid_argument', async () => {
@@ -110,64 +110,64 @@ describe('orchestrator.commands Result contract (Шаг 7)', () => {
     assertErr(await commands.enqueue({ channel: fakeChannel, query: '   ' }), 'invalid_argument');
   });
 
-  test('skip/previousTrack с живым guildId, но без плеера → Err (доменный код)', () => {
+  test('skip/previousTrack с живым guildId, но без плеера → Err (доменный код)', async () => {
     // Нет ensurePlayer для UNKNOWN_GUILD — music.skip/previousTrack вернут false.
     // Проверяем что прокси оборачивает false в осмысленный Err с code.
     const unknownGuild = `orchestrator-no-player-${Date.now()}`;
-    const r1 = commands.skip(unknownGuild);
+    const r1 = await commands.skip(unknownGuild);
     assert.equal(r1.ok, false);
     assert.equal(/** @type {any} */ (r1).code, 'not_playing');
-    const r2 = commands.previousTrack(unknownGuild);
+    const r2 = await commands.previousTrack(unknownGuild);
     assert.equal(r2.ok, false);
     assert.equal(/** @type {any} */ (r2).code, 'no_history');
   });
 
-  test('toggleRepeat/toggleAutoplay на свежем guildId → Ok с enabled=true, повтор → false', () => {
+  test('toggleRepeat/toggleAutoplay на свежем guildId → Ok с enabled=true, повтор → false', async () => {
     const freshGuild = `orchestrator-toggle-${Date.now()}`;
-    const r1 = commands.toggleRepeat(freshGuild);
+    const r1 = await commands.toggleRepeat(freshGuild);
     assert.equal(r1.ok, true);
     assert.equal(/** @type {any} */ (r1).value.enabled, true);
-    const r2 = commands.toggleRepeat(freshGuild);
+    const r2 = await commands.toggleRepeat(freshGuild);
     assert.equal(r2.ok, true);
     assert.equal(/** @type {any} */ (r2).value.enabled, false);
 
-    const a1 = commands.toggleAutoplay(freshGuild);
+    const a1 = await commands.toggleAutoplay(freshGuild);
     assert.equal(a1.ok, true);
     assert.equal(/** @type {any} */ (a1).value.enabled, true);
     // Repeat уже off после второго toggleRepeat → toggleAutoplay не должен ронять инвариант
-    const a2 = commands.toggleAutoplay(freshGuild);
+    const a2 = await commands.toggleAutoplay(freshGuild);
     assert.equal(a2.ok, true);
     assert.equal(/** @type {any} */ (a2).value.enabled, false);
   });
 
-  test('stopAndLeave на любом guildId идемпотентен и возвращает Ok', () => {
+  test('stopAndLeave на любом guildId идемпотентен и возвращает Ok', async () => {
     const freshGuild = `orchestrator-stop-${Date.now()}`;
-    const r1 = commands.stopAndLeave(freshGuild);
+    const r1 = await commands.stopAndLeave(freshGuild);
     assert.equal(r1.ok, true);
-    const r2 = commands.stopAndLeave(freshGuild);
+    const r2 = await commands.stopAndLeave(freshGuild);
     assert.equal(r2.ok, true);
   });
 
-  test('pause/resume на guildId без плеера → Err not_applicable', () => {
+  test('pause/resume на guildId без плеера → Err not_applicable', async () => {
     const unknownGuild = `orchestrator-pause-${Date.now()}`;
-    const rp = commands.pause(unknownGuild);
+    const rp = await commands.pause(unknownGuild);
     assert.equal(rp.ok, false);
     assert.equal(/** @type {any} */ (rp).code, 'not_applicable');
-    const rr = commands.resume(unknownGuild);
+    const rr = await commands.resume(unknownGuild);
     assert.equal(rr.ok, false);
     assert.equal(/** @type {any} */ (rr).code, 'not_applicable');
   });
 
-  test('Ok-результаты заморожены (Result иммутабелен)', () => {
+  test('Ok-результаты заморожены (Result иммутабелен)', async () => {
     const fresh = `orchestrator-freeze-${Date.now()}`;
-    const r = commands.stopAndLeave(fresh);
+    const r = await commands.stopAndLeave(fresh);
     assert.equal(Object.isFrozen(r), true);
-    const r2 = commands.toggleRepeat(fresh);
+    const r2 = await commands.toggleRepeat(fresh);
     assert.equal(Object.isFrozen(r2), true);
   });
 
-  test('Err-результаты заморожены', () => {
-    const r = commands.skip(null);
+  test('Err-результаты заморожены', async () => {
+    const r = await commands.skip(null);
     assert.equal(Object.isFrozen(r), true);
   });
 });

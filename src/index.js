@@ -35,11 +35,12 @@ import {
 import sodium from 'libsodium-wrappers';
 
 import { chatOllama } from './ollama.js';
-import { enqueue, registerAutoplayUserQuery } from './music.js';
+import { registerAutoplayUserQuery } from './music.js';
 import { orchestrator } from './orchestrator.js';
 import {
   addTracksAndUpdateUI,
   initMusicUi,
+  registerPendingSingleLine,
 } from './music-panel.js';
 import {
   attachVoiceAutoLeave,
@@ -85,7 +86,8 @@ registerVoiceAdapterCallbacks({
   onVoiceReady: (guildId, channelId) => orchestrator.events.onVoiceReady(guildId, channelId),
   onVoiceGone: (guildId, reason) => orchestrator.events.onVoiceGone(guildId, reason),
   onAutoLeaveTimeout: (guildId) => {
-    orchestrator.commands.stopAndLeave(guildId);
+    // fire-and-forget: auto-leave is background, нет UI-отклика.
+    void orchestrator.commands.stopAndLeave(guildId);
   },
 });
 
@@ -184,19 +186,28 @@ async function runEnqueueFlow(interaction, rawQuery) {
   const guildId = String(interaction.guildId);
   registerAutoplayUserQuery(guildId, rawQuery);
 
-  const result = await enqueue(
-    voice,
-    rawQuery,
-    'single',
-    interaction.user.id,
-    interaction.user.displayName ?? interaction.user.username ?? null,
-  );
+  const addedByName = interaction.user.displayName ?? interaction.user.username ?? null;
 
-  const line = formatSingleQueueLine(result.trackLabel, {
-    addedBy: interaction.user.displayName ?? interaction.user.username ?? null,
+  const res = await orchestrator.commands.enqueue({
+    channel: voice,
+    query: rawQuery,
+    source: 'single',
+    userId: interaction.user.id,
+    userDisplayName: addedByName,
   });
 
-  await addTracksAndUpdateUI(interaction, [line], result.panelHint);
+  if (!res.ok) {
+    // Поднимаем наверх — catch в /play / runTextCommand покажет ошибку юзеру.
+    throw new Error(res.reason || 'enqueue failed');
+  }
+
+  const line = formatSingleQueueLine(res.value.trackLabel, { addedBy: addedByName });
+
+  await addTracksAndUpdateUI(interaction, [line], res.value.panelHint);
+
+  // FIFO-регистрация для замены placeholder'а (raw query) на реальное название
+  // трека в момент старта — см. music-panel._replacePendingSingleLineWithLabel.
+  registerPendingSingleLine(guildId, line, addedByName);
 }
 
 // ─── Lifecycle ───────────────────────────────────────────────────────────────
@@ -274,17 +285,17 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.commandName === 'skip') {
-      const res = orchestrator.commands.skip(interaction.guildId, interaction.user.id);
-      await interaction.reply({
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const res = await orchestrator.commands.skip(interaction.guildId, interaction.user.id);
+      await interaction.editReply({
         content: res.ok ? 'Пропуск…' : 'Ничего не играет.',
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
 
     if (interaction.commandName === 'stop') {
-      orchestrator.commands.stopAndLeave(interaction.guildId);
       await interaction.reply({ content: 'Остановлено.', flags: MessageFlags.Ephemeral });
+      await orchestrator.commands.stopAndLeave(interaction.guildId);
       return;
     }
   } catch (err) {

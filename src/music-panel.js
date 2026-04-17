@@ -1,15 +1,17 @@
 /**
- * Дописывание строки автоплея в список: при METRICS_TXT?0 > data/metrics/music-ui.txt; иначе console.
+ * Дописывание строки автоплея в список: при METRICS_TXT=1 → data/metrics/music-ui.txt; иначе console.
  * Док: docs/НАБЛЮДАЕМОСТЬ.md
  *
- * music-ui.js — сессионный UI музыкального плеера.
+ * music-panel.js — сессионный UI музыкального плеера.
  *
  * Отвечает за:
  *  - единственное сообщение-список (Список:) на гильдию
- *  - единственное сообщение-панель с кнопками
+ *  - единственное сообщение-панель с кнопками на гильдию
  *  - синхронизацию контента при смене трека, idle, autoplay
+ *  - placeholder-replace: raw-query строка → реальное название трека
+ *    при старте воспроизведения (через QueueEntry.tag)
  *
- * Инициализация: вызови initMusicUi(client) до регистрации коллбэков.
+ * Инициализация: вызови initMusicUi(client) до регистрации обработчиков.
  */
 
 import { isPlaybackMetricsEnabled, logMusicUiLine } from './playback-metrics.js';
@@ -29,23 +31,26 @@ import {
   resolvePlayerUIState,
   PlayerState,
   StatusReason,
+  currentPlayingLabelByGuild,
 } from './guild-session-state.js';
-import { formatAutoplayQueueLine } from './queue-line-format.js';
+import { formatAutoplayQueueLine, formatSingleQueueLine } from './queue-line-format.js';
 import { resolveYoutubeCanonicalTitle } from './youtube-search.js';
 
 /** @type {import('discord.js').Client | null} */
 let cl = null;
 
-/** Инициализирует модуль клиентом Discord. Вызывать до регистрации обработчиков. */
+/** Инициализирует модуль клиентом Discord. */
 export function initMusicUi(client) {
   cl = client;
 
   setOnMusicForceStop((guildId) => {
     void deleteAllMusicUi(guildId);
   });
-  setOnPlayingTrackDisplay((guildId, _label) => {
-    // PlayerState is already PLAYING (set by music.js before this callback fires).
-    // _panelContent reads from resolvePlayerUIState — no need to pass label explicitly.
+  setOnPlayingTrackDisplay((guildId, label) => {
+    // PlayerState уже PLAYING (выставлен music.js).
+    // Сначала — replace placeholder в списке (raw query → реальное название),
+    // затем общий refresh панели.
+    void _replacePendingSingleLineWithLabel(guildId, label);
     void refreshSessionPanelFromState(guildId);
   });
   setOnPlaybackIdle((guildId) => {
@@ -73,18 +78,40 @@ function _safeLine(s, max = 380) {
   return String(s).replace(/@/g, '@\u200b').trim().slice(0, max);
 }
 
-// --- Стейт ------------------------------------------------------------------
+// --- Состояние ------------------------------------------------------------
+
+/**
+ * @typedef {{ type: 'single', id: number, addedBy: string | null }} SingleTag
+ * @typedef {{ text: string, tag: SingleTag | null }} QueueEntry
+ */
 
 /**
  * Единственное сессионное сообщение-список очереди на гильдию.
- * @type {Map<string, {channelId:string, messageId:string, lines:string[]}>}
+ *
+ * lines — типизированные записи. Поле `tag` нужно для надёжного
+ * placeholder-replace: строка с raw query получает уникальный
+ * tag.id; при старте воспроизведения находим её по id (не по тексту)
+ * и заменяем на реальное название. Устойчиво к дубликатам
+ * raw-query и MAX_QUEUE_LINES-эвикции.
+ *
+ * @type {Map<string, { channelId: string, messageId: string, lines: QueueEntry[] }>}
  */
 const sessionQueueByGuild = new Map();
 
 /**
- * Единственное сообщение-панель с кнопками на гильдию.
- * @type {Map<string, {channelId:string, messageId:string}>}
+ * FIFO-очередь id'шек ожидающих placeholder-replace на guild.
+ * Треки стартуют в порядке добавления, registerPendingSingleLine
+ * вызывается в том же порядке — FIFO-порядок гарантирован.
+ *
+ * @type {Map<string, number[]>}
  */
+const pendingSingleIdsByGuild = new Map();
+
+/** Monotonic counter for unique placeholder tag ids. */
+let _nextSingleTagId = 1;
+
+/** Единственное сообщение-панель с кнопками на гильдию. */
+/** @type {Map<string, { channelId: string, messageId: string }>} */
 const sessionPanelByGuild = new Map();
 
 /** Максимум строк в очереди (скользящее окно при переполнении). */
@@ -94,10 +121,56 @@ const MAX_QUEUE_LINES = 25;
 const PANEL_LOADING = 'Загрузка трека…';
 const PANEL_IDLE = 'Сейчас ничего не воспроизводится.';
 const PANEL_AUTOPLAY_WAIT = 'Подбираем следующий трек…';
+const PANEL_AUTOPLAY_ERROR = 'Автоподбор ничего не нашёл. Добавь трек вручную.';
+const PANEL_PAUSE_FALLBACK = 'На паузе.';
 
 /**
- * Resolves the panel status line from PlayerState + StatusReason.
- * Single switch — music-ui.js never re-derives state logic itself.
+ * Зарегистрировать placeholder. Находит в session.lines первую
+ * UNTAGGED запись с text === placeholderText, навешивает тег.
+ * id тега идёт в FIFO-очередь pendingSingleIdsByGuild.
+ *
+ * ДОЛЖНО вызываться ПОСЛЕ того как строка уже попала в
+ * lines (через addTracksAndUpdateUI → appendToSessionQueue).
+ *
+ * Если untagged-совпадения нет (например, строка была
+ * panelHint) — тег не регистрируем.
+ *
+ * @param {string} guildId
+ * @param {string} placeholderText
+ * @param {string | null} [addedBy]
+ */
+export function registerPendingSingleLine(guildId, placeholderText, addedBy = null) {
+  const id = String(guildId);
+  const session = sessionQueueByGuild.get(id);
+  if (!session) return;
+
+  const idx = session.lines.findIndex(
+    (e) => e.tag == null && e.text === placeholderText,
+  );
+  if (idx === -1) return;
+
+  const tagId = _nextSingleTagId++;
+  session.lines[idx] = {
+    text: session.lines[idx].text,
+    tag: {
+      type: 'single',
+      id: tagId,
+      addedBy: addedBy == null ? null : String(addedBy),
+    },
+  };
+
+  const list = pendingSingleIdsByGuild.get(id) ?? [];
+  list.push(tagId);
+  pendingSingleIdsByGuild.set(id, list);
+}
+
+function clearPendingSingleLines(guildId) {
+  pendingSingleIdsByGuild.delete(String(guildId));
+}
+
+/**
+ * Резолвит статус-строку панели по PlayerState + StatusReason.
+ * Единственный switch — логика состояний здесь не дублируется.
  * @param {string} guildId
  * @returns {string}
  */
@@ -106,33 +179,62 @@ function _panelStatusLine(guildId) {
   switch (playerState) {
     case PlayerState.LOADING:
       return PANEL_LOADING;
-    case PlayerState.IDLE_EXHAUSTED:
-      if (statusReason === StatusReason.AUTOPLAY_ERROR) {
-        // Show "searching…" only while autoplay is actually on.
-        // If user turned autoplay off mid-spawn, state may still carry AUTOPLAY_ERROR — fall back to idle.
-        const ts = getMusicTransportState(guildId);
-        return ts?.autoplay ? PANEL_AUTOPLAY_WAIT : PANEL_IDLE;
+
+    case PlayerState.IDLE_EXHAUSTED: {
+      const ts = getMusicTransportState(guildId);
+      // Матрица (autoplay, statusReason):
+      //   autoplay ON  + AUTOPLAY_ERROR → «Автоподбор ничего не нашёл»
+      //   autoplay ON  + no error       → «Подбираем следующий трек…»
+      //   autoplay OFF                  → PANEL_IDLE
+      if (ts?.autoplay) {
+        return statusReason === StatusReason.AUTOPLAY_ERROR
+          ? PANEL_AUTOPLAY_ERROR
+          : PANEL_AUTOPLAY_WAIT;
       }
       return PANEL_IDLE;
+    }
+
     case PlayerState.PAUSED:
-      return PANEL_IDLE; // fallback — actual content shown separately when paused+label available
+      // Fallback: _panelContent обычно показывает «На паузе: X»,
+      // сюда приходим только если label потерялся.
+      return PANEL_PAUSE_FALLBACK;
+
     default:
       return PANEL_IDLE;
   }
 }
 
-// --- Строители контента ------------------------------------------------------
+/**
+ * Label текущего трека с fallback-цепочкой:
+ *   getRepeatableTrackLabel → currentPlayingLabelByGuild → null.
+ * Редкая гонка: PAUSED/PLAYING без записанного label —
+ * fallback на прямое чтение Map.
+ *
+ * @param {string} guildId
+ * @returns {string | null}
+ */
+function _resolveActiveLabel(guildId) {
+  const direct = getRepeatableTrackLabel(guildId);
+  if (direct != null && String(direct).trim()) return String(direct);
+  const mapLabel = currentPlayingLabelByGuild.get(String(guildId));
+  if (mapLabel != null && String(mapLabel).trim()) return String(mapLabel);
+  return null;
+}
 
-function _buildQueueContent(lines) {
-  return _clip('**Список:**\n' + lines.join('\n') + '\n\u200b');
+// --- Строители контента ------------------------------------------------
+
+/** @param {QueueEntry[]} entries */
+function _buildQueueContent(entries) {
+  return _clip('**Список:**\n' + entries.map((e) => e.text).join('\n') + '\n\u200b');
 }
 
 function _panelContent(guildId) {
   if (!guildId) return _safeLine(_clip(PANEL_IDLE), 2000);
   const { playerState } = resolvePlayerUIState(guildId);
+
   if (playerState === PlayerState.PLAYING || playerState === PlayerState.PAUSED) {
-    const label = getRepeatableTrackLabel(guildId);
-    if (label != null && String(label).trim()) {
+    const label = _resolveActiveLabel(guildId);
+    if (label != null) {
       const info = getCurrentPlaybackInfo(guildId);
       const prefix = playerState === PlayerState.PAUSED ? 'На паузе: ' : 'Сейчас играет: ';
       const queueFrag = info?.queueDepth > 0 ? ` · ещё ${info.queueDepth} в очереди` : '';
@@ -149,6 +251,9 @@ function _panelRows(guildId) {
       paused: false,
       canPrevious: false,
       canSkipForward: false,
+      canRepeatToggle: false,
+      canAutoplayToggle: false,
+      canLike: false,
       repeat: false,
       autoplay: false,
       loading: false,
@@ -162,13 +267,18 @@ function _panelRows(guildId) {
 /**
  * Добавляет строки в сессионное сообщение очереди.
  * Если сообщения ещё нет — создаёт; если есть — редактирует.
+ *
+ * @param {string} guildId
+ * @param {string} channelId
+ * @param {string[]} newLines — сырые тексты, оборачиваются в untagged entries
  */
 export async function appendToSessionQueue(guildId, channelId, newLines) {
   const id = String(guildId);
   const session = sessionQueueByGuild.get(id);
+  const entries = newLines.map((t) => ({ text: String(t), tag: null }));
 
   if (session) {
-    session.lines.push(...newLines);
+    session.lines.push(...entries);
     while (session.lines.length > MAX_QUEUE_LINES) session.lines.shift();
     try {
       const ch = await cl.channels.fetch(session.channelId).catch(() => null);
@@ -186,7 +296,7 @@ export async function appendToSessionQueue(guildId, channelId, newLines) {
   try {
     const ch = await cl.channels.fetch(channelId).catch(() => null);
     if (ch?.isTextBased()) {
-      const lines = [...newLines].slice(-MAX_QUEUE_LINES);
+      const lines = entries.slice(-MAX_QUEUE_LINES);
       const msg = await ch.send({ content: _buildQueueContent(lines) });
       sessionQueueByGuild.set(id, { channelId, messageId: msg.id, lines });
     }
@@ -197,7 +307,7 @@ export async function appendToSessionQueue(guildId, channelId, newLines) {
 
 /**
  * Обновляет или создаёт сессионную панель с кнопками.
- * Если панель уже есть — редактирует на месте. Если нет — отправляет новую.
+ * Если панель уже есть — редактирует на месте. Иначе — отправляет.
  */
 export async function ensureSessionPanel(guildId, channelId, panelHint) {
   const id = String(guildId);
@@ -237,6 +347,7 @@ export async function deleteAllMusicUi(guildId) {
   const panel = sessionPanelByGuild.get(id);
   sessionQueueByGuild.delete(id);
   sessionPanelByGuild.delete(id);
+  clearPendingSingleLines(id);
   for (const ref of [queue, panel].filter(Boolean)) {
     try {
       const ch = await cl.channels.fetch(ref.channelId).catch(() => null);
@@ -246,9 +357,64 @@ export async function deleteAllMusicUi(guildId) {
 }
 
 /**
- * Обновляет кнопки/контент на сообщении панели по interaction (после deferUpdate).
- * Ставит редактирование в очередь — предотвращает гонку с фоновыми refreshSessionPanelFromState.
- * Стейт читается в момент выполнения, а не в момент вызова этой функции.
+ * Заменить placeholder-строку на настоящее название
+ * трека. Вызывается из onPlayingTrackDisplay.
+ *
+ * Алгоритм:
+ *   1. Поп первый id из pendingSingleIdsByGuild (FIFO).
+ *   2. Найти в session.lines запись с tag.id === popped.
+ *      Если нет — строку эвикнул MAX_QUEUE_LINES или
+ *      удалил deleteAllMusicUi — no-op.
+ *   3. Заменить text на formatSingleQueueLine(realLabel, { addedBy }),
+ *      снять tag (запись становится «обычной»).
+ *   4. Отредактировать Discord-сообщение.
+ *
+ * Устойчиво к дубликатам raw-query и гонкам FIFO:
+ * ищем по уникальному числовому tag.id, не по тексту.
+ *
+ * @param {string} guildId
+ * @param {string} realLabel
+ */
+async function _replacePendingSingleLineWithLabel(guildId, realLabel) {
+  const id = String(guildId);
+  const pending = pendingSingleIdsByGuild.get(id);
+  if (!pending || pending.length === 0) return;
+  const tagId = pending.shift();
+  if (pending.length === 0) pendingSingleIdsByGuild.delete(id);
+
+  const session = sessionQueueByGuild.get(id);
+  if (!session) return;
+
+  const idx = session.lines.findIndex(
+    (e) => e.tag?.type === 'single' && e.tag.id === tagId,
+  );
+  if (idx === -1) return;
+
+  const addedBy = session.lines[idx].tag?.addedBy ?? null;
+  const newText = formatSingleQueueLine(String(realLabel), { addedBy });
+  if (newText === session.lines[idx].text) {
+    session.lines[idx] = { text: session.lines[idx].text, tag: null };
+    return;
+  }
+  session.lines[idx] = { text: newText, tag: null };
+
+  try {
+    const ch = await cl.channels.fetch(session.channelId).catch(() => null);
+    const msg = ch?.isTextBased()
+      ? await ch.messages.fetch(session.messageId).catch(() => null)
+      : null;
+    if (msg?.editable) {
+      await msg.edit({ content: _buildQueueContent(session.lines) });
+    }
+  } catch (e) {
+    console.warn('[queue] replace placeholder failed', e);
+  }
+}
+
+/**
+ * Обновляет кнопки/контент на сообщении панели по interaction
+ * (после deferUpdate). Ставит редактирование в очередь
+ * — предотвращает гонку с фоновыми refreshSessionPanelFromState.
  */
 export function syncInteractionMusicPanel(interaction) {
   const msg = interaction.message;
@@ -260,8 +426,8 @@ export function syncInteractionMusicPanel(interaction) {
 }
 
 /**
- * Общая логика перечитывания панели из Discord и редактирования по актуальному стейту.
- * Используется двумя путями с разным поведением очередизации (см. ниже).
+ * Общая логика перечитывания панели из Discord и редактирования
+ * по актуальному стейту.
  */
 async function _doRefreshPanelAsync(guildId) {
   const id = String(guildId);
@@ -275,33 +441,24 @@ async function _doRefreshPanelAsync(guildId) {
 }
 
 /**
- * Перечитывает и обновляет панель без очереди — для переходных состояний (LOADING).
- *
- * Почему без очереди:
- *   notifyPlaybackUiRefresh вызывается во время коротких переходных состояний (загрузка URL,
- *   поиск autoplay). Если эти обновления ставить в очередь, они могут выполниться ПОСЛЕ того,
- *   как playerState уже стал PLAYING — и переходное состояние пропадёт для пользователя.
- *   Fire-and-forget запускает fetch немедленно (~200-400ms), чтение стейта происходит раньше,
- *   чем он успевает поменяться с LOADING на PLAYING.
+ * Перечитывает и обновляет панель без очереди — для переходных
+ * состояний (LOADING). Fire-and-forget: стейт читается раньше,
+ * чем может поменяться с LOADING на PLAYING.
  */
 function immediateRefreshPanel(guildId) {
   void _doRefreshPanelAsync(String(guildId)).catch((e) => console.warn('[music] refresh panel', e));
 }
 
 /**
- * Перечитывает панель через очередь — для финальных состояний (PLAYING, IDLE).
- *
- * Почему через очередь:
- *   Эти обновления инициируются фоново (трек начался / трек закончился) и могут гоняться
- *   с syncInteractionMusicPanel (нажатие кнопки). Очередь гарантирует последовательное
- *   применение: последнее актуальное состояние всегда побеждает, без перезаписей из прошлого.
+ * Перечитывает панель через очередь — для финальных состояний
+ * (PLAYING, IDLE). Очередь защищает от гонок с syncInteractionMusicPanel.
  */
 function refreshSessionPanelFromState(guildId) {
   const id = String(guildId);
   schedulePanelUpdate(id, () => _doRefreshPanelAsync(id).catch((e) => console.warn('[music] refresh panel', e)));
 }
 
-/** Очередь доиграла / смена состояния — перерисовать панель по актуальному стейту (idle / autoplay-wait / загрузка). */
+/** Очередь доиграла / смена состояния — перерисовать панель. */
 export function applyIdleMusicUi(guildId) {
   if (sessionPanelByGuild.has(String(guildId))) {
     refreshSessionPanelFromState(guildId);
@@ -309,16 +466,16 @@ export function applyIdleMusicUi(guildId) {
 }
 
 /**
- * Возвращает текущий fragment для панели.
- * Если что-то играет — текущий трек; иначе загрузка / idle / ожидание автоплея; при guildId == null — fallback.
+ * Фрагмент для панели: текущий трек или статус-строка.
  */
 export function panelFragmentForMusicUi(guildId, fallback = '') {
   if (guildId == null) return fallback;
   const { playerState } = resolvePlayerUIState(guildId);
   if (playerState === PlayerState.PLAYING || playerState === PlayerState.PAUSED) {
-    const label = getRepeatableTrackLabel(guildId);
-    if (label != null && String(label).trim()) {
-      return `Сейчас играет: **${_safeLine(String(label), 200)}**`;
+    const label = _resolveActiveLabel(guildId);
+    if (label != null) {
+      const prefix = playerState === PlayerState.PAUSED ? 'На паузе: ' : 'Сейчас играет: ';
+      return `${prefix}**${_safeLine(String(label), 200)}**`;
     }
   }
   return _panelStatusLine(guildId);
@@ -326,7 +483,8 @@ export function panelFragmentForMusicUi(guildId, fallback = '') {
 
 /**
  * Добавляет треки в сессионный список и обновляет панель.
- * Эфемерный ответ на interaction сразу удаляется (список обновился визуально).
+ * Эфемерный ответ на interaction сразу удаляется (список
+ * обновился визуально).
  */
 export async function addTracksAndUpdateUI(interaction, queueLines, panelHint) {
   const gid = interaction.guildId;
@@ -337,8 +495,7 @@ export async function addTracksAndUpdateUI(interaction, queueLines, panelHint) {
 
   /**
    * Панель всегда показывает «сейчас играет», если что-то играет.
-   * Подсказка «В очереди: …» только для списка — не подменяет заголовок текущего трека.
-   * Для первого трека enqueue отдаёт «Сейчас играет» — её используем.
+   * Подсказка «В очереди: …» только для списка.
    */
   const ph = panelHint && String(panelHint).trim() ? String(panelHint).trim() : '';
   const playingFrag = panelFragmentForMusicUi(gid);
@@ -382,3 +539,25 @@ async function _notifyAutoplaySpawned(guildId, items) {
     console.log(`[autoplay] ${line}`);
   }
 }
+
+// --- Test-only API ---------------------------------------------------------
+
+/** @internal */
+export const __test__ = {
+  reset() {
+    sessionQueueByGuild.clear();
+    sessionPanelByGuild.clear();
+    pendingSingleIdsByGuild.clear();
+    _nextSingleTagId = 1;
+  },
+  setClient(client) { cl = client; },
+  getQueueState(guildId) { return sessionQueueByGuild.get(String(guildId)); },
+  getPendingIds(guildId) { return [...(pendingSingleIdsByGuild.get(String(guildId)) ?? [])]; },
+  /** Seed queue state without touching Discord API. */
+  seedQueueState(guildId, state) {
+    sessionQueueByGuild.set(String(guildId), state);
+  },
+  async triggerReplace(guildId, realLabel) {
+    return _replacePendingSingleLineWithLabel(guildId, realLabel);
+  },
+};

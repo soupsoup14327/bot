@@ -1,28 +1,31 @@
 /**
- * personal-signals.js
+ * personal-signals.js — STUB (feature unavailable).
  *
- * PersonalSignal events — user-authored intents (likes и т.п.).
+ * Настоящая персистентность лайков появится вместе с БД приложения
+ * (пользовательская БД — отдельный будущий модуль `src/db/*`). До тех пор
+ * `emitLike` возвращает `{ ok: false, reason: 'not_implemented' }`, а
+ * кнопка ❤ в UI показывает соответствующее сообщение об ошибке.
  *
- * В текущей сборке DB-слой отсутствует (HTTP API / persistence-пласт ещё
- * не реализованы), поэтому emitLike работает как no-op: всегда возвращает
- * { ok: true, removed: false }. Это сохраняет совместимость с
- * button-handlers.js (BTN_LIKE) и UX ("добавлено в избранное"), но
- * фактически ничего не персистит.
+ * Почему stub, а не локальный файл:
+ *   - чтобы не плодить временный UX (pseudo-успех, затем миграция из
+ *     файла в БД);
+ *   - чтобы разница «лайки работают / лайки НЕ работают» была явной в
+ *     логах и интерфейсе.
  *
- * Когда появится реальный backend (SQLite/Postgres), тут вернётся
- * toggle-логика с retry × 3 и обязательной доставкой (must_persist).
+ * Контракт — стабильный: будущая реализация вернёт `{ ok: true, removed }`,
+ * вызывающий код уже обрабатывает оба варианта через поле `ok`.
  */
 
 /**
- * @param {{
- *   userId:    string,
- *   guildId:   string,
- *   url:       string,
- *   title:     string,
- *   sessionId: string | null,
- * }} _params
- * @returns {Promise<{ ok: true, removed: boolean }>}
+ * @returns {Promise<{ ok: false, reason: 'not_implemented' }>}
  */
-export async function emitLike(_params) {
-  return { ok: true, removed: false };
+export async function emitLike() {
+  return { ok: false, reason: 'not_implemented' };
+}
+
+/**
+ * @returns {Promise<Array<never>>}
+ */
+export async function listLikes() {
+  return [];
 }

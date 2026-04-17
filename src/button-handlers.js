@@ -1,16 +1,16 @@
 /**
  * Обработчики кнопок музыкальной панели.
  *
- * Каждый обработчик:
- *   1. Вызывает доменный use-case через `orchestrator.commands.*`
- *   2. Делает deferUpdate() чтобы Discord не показывал «думает»
- *   3. Ставит обновление панели в очередь через syncInteractionMusicPanel
+ * Порядок действий в каждом обработчике:
+ *   1. `deferUpdate()` ПЕРВЫМ — чтобы уложиться в 3-секундный бюджет
+ *      ACK'а Discord-интеракции, даже если команда в очереди за другой.
+ *   2. `await orchestrator.commands.*` — команды теперь async и сериализованы
+ *      per-guild в command-queue.js. Два юзера жмут одновременно — команды
+ *      выполняются строго по очереди, не гоняясь за один и тот же state.
+ *   3. `syncInteractionMusicPanel` — рефреш UI ПОСЛЕ мутации, иначе панель
+ *      покажет устаревший snapshot.
  *
  * index.js остаётся тонким роутером и ничего не знает о деталях кнопок.
- *
- * Шаг 7: обработчики больше не зависят от `music.js` напрямую — только
- * через `orchestrator.commands`. Это делает Discord-слой взаимозаменяемым
- * (будущий HTTP/WebSocket API будет вызывать те же команды).
  */
 
 import { MessageFlags } from 'discord.js';
@@ -40,14 +40,14 @@ export async function handleButtonInteractions(interaction) {
 
   switch (interaction.customId) {
     case BTN_SKIP:
-      orchestrator.commands.skip(interaction.guildId, interaction.user.id);
       await interaction.deferUpdate();
+      await orchestrator.commands.skip(interaction.guildId, interaction.user.id);
       await syncInteractionMusicPanel(interaction);
       break;
 
     case BTN_PREV: {
       await interaction.deferUpdate();
-      const res = orchestrator.commands.previousTrack(interaction.guildId, interaction.user.id);
+      const res = await orchestrator.commands.previousTrack(interaction.guildId, interaction.user.id);
       if (!res.ok) {
         await interaction.followUp({
           content: 'Назад некуда — это первый трек в этой сессии или плеер сейчас не активен.',
@@ -59,32 +59,32 @@ export async function handleButtonInteractions(interaction) {
     }
 
     case BTN_REPEAT:
-      orchestrator.commands.toggleRepeat(interaction.guildId);
       await interaction.deferUpdate();
+      await orchestrator.commands.toggleRepeat(interaction.guildId);
       await syncInteractionMusicPanel(interaction);
       break;
 
     case BTN_AUTOPLAY:
-      orchestrator.commands.toggleAutoplay(interaction.guildId);
       await interaction.deferUpdate();
+      await orchestrator.commands.toggleAutoplay(interaction.guildId);
       await syncInteractionMusicPanel(interaction);
       break;
 
     case BTN_PAUSE:
-      orchestrator.commands.pause(interaction.guildId);
       await interaction.deferUpdate();
+      await orchestrator.commands.pause(interaction.guildId);
       await syncInteractionMusicPanel(interaction);
       break;
 
     case BTN_RESUME:
-      orchestrator.commands.resume(interaction.guildId);
       await interaction.deferUpdate();
+      await orchestrator.commands.resume(interaction.guildId);
       await syncInteractionMusicPanel(interaction);
       break;
 
     case BTN_STOP:
-      orchestrator.commands.stopAndLeave(interaction.guildId);
       await interaction.reply({ content: 'Остановлено.', flags: MessageFlags.Ephemeral });
+      await orchestrator.commands.stopAndLeave(interaction.guildId);
       break;
 
     case BTN_ADD_MENU:
@@ -100,19 +100,27 @@ export async function handleButtonInteractions(interaction) {
         await interaction.editReply({ content: 'Сейчас ничего не играет.' });
         break;
       }
+      // personal-signals.js — stub до появления БД. emitLike возвращает
+      // { ok:false, reason:'not_implemented' } — показываем честную ошибку,
+      // чтобы не плодить временный UX «успех без персистентности».
       try {
-        const { removed } = await emitLike({
+        const res = await emitLike({
           userId,
           guildId,
           url: snapshot.currentUrl,
           title: snapshot.currentLabel ?? snapshot.currentUrl,
           sessionId: getSessionId(guildId),
         });
-        await interaction.editReply({
-          content: removed ? 'Убрано из избранного' : 'Добавлено в избранное ❤',
-        });
+        if (res.ok) {
+          const head = res.removed ? 'Убрано из избранного' : 'Добавлено в избранное ❤';
+          await interaction.editReply({ content: head });
+        } else {
+          await interaction.editReply({
+            content: 'Избранное пока не работает — ждём БД приложения.',
+          });
+        }
       } catch (err) {
-        console.error('[like] failed to persist', err);
+        console.error('[like] failed', err);
         await interaction.editReply({ content: 'Не удалось сохранить — попробуй ещё раз.' });
       }
       break;

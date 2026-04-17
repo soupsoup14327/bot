@@ -93,9 +93,6 @@ import {
   executeLivePreviousMachine,
   executeSkipPreStopMachine,
 } from './idle-navigation-machine-api.js';
-import {
-  applyRepeatPreviousRestart,
-} from './idle-navigation-apply.js';
 import { stopWithNavigationSignal } from './navigation-stop-flow.js';
 import {
   clearSignalBuffer,
@@ -249,7 +246,15 @@ export async function enqueue(
  */
 export function skip(guildId, actorUserId = null) {
   const id = String(guildId);
-  if (!isPlayerPlaying(id)) return false;
+
+  // Разрешаем skip из playing И paused. Раньше был строгий гейт
+  // `if (!isPlayerPlaying) return false` — он оставлял пользователя
+  // в «пауза → нельзя пропустить, надо сначала resume» (лишний клик).
+  // stopPlayer() на паузе корректно даёт Idle → playNext.
+  const nowPlaying = isPlayerPlaying(id);
+  const status = getPlayerStatus(id)?.toString?.() ?? '';
+  const paused = status === 'paused' || status === 'autopaused';
+  if (!nowPlaying && !paused) return false;
 
   const s = getGuildMusicState(id);
   const queue = getQueueOps(id);
@@ -288,12 +293,16 @@ export function skip(guildId, actorUserId = null) {
  * Перейти на предыдущий трек сессии.
  *
  * Ветки:
- *   - repeat ON + что-то играет → просто рестартуем текущий трек.
- *   - live (играет, есть стек past)  → подложить prev + current в head очереди,
- *     остановить поток и эмитить `track_previous`.
- *   - idle (бот в канале, плеер idle) → восстановить через idle-navigation
- *     history и запланировать `playNext`.
+ *   - live (играет/пауза, есть стек past) → подложить prev + current в head
+ *     очереди, остановить поток и эмитить `track_previous`.
+ *   - idle (бот в канале, плеер idle, есть sessionHistory) → восстановить
+ *     через idle-navigation history и запланировать `playNext`.
  *   - иначе — false (сигнализируем UI что некуда).
+ *
+ * Семантика: prev ВСЕГДА «назад по истории». Repeat НЕ делает из prev
+ * рестарт текущего трека — это дало бы UI-контракту «prev = назад» две
+ * разных семантики в зависимости от репита. Симметрично UI-фиксу
+ * canPrevious в getMusicTransportState.
  *
  * @param {string} guildId
  * @param {string | null} [actorUserId]
@@ -308,17 +317,6 @@ export function previousTrack(guildId, actorUserId = null) {
   const currentUrl = currentPlayingUrlByGuild.get(id) ?? '';
   const currentItem = currentQueueItemByGuild.get(id) ?? null;
   const nowPlaying = isPlayerPlaying(id);
-
-  // Repeat + живой трек — не прыгаем назад, а перезапускаем текущий.
-  if (nowPlaying && repeatByGuild.has(id)) {
-    applyRepeatPreviousRestart({
-      guildId: id,
-      s,
-      killYtdlp,
-      stopPlayer,
-    });
-    return true;
-  }
 
   const paused = getPlayerStatus(id) != null && !nowPlaying
     && (getPlayerStatus(id)?.toString?.() === 'paused'
@@ -521,11 +519,39 @@ export function isGuildPlayingMusic(guildId) {
 /**
  * UI-state для панели (buildMusicControlRows).
  *
- * Решения:
+ * Решения (зеркалят, что реально отработает при нажатии — чтобы disabled кнопки
+ * совпадал с `return false` в соответствующей команде music.js):
+ *
  *   - hasActiveTrack — плеер подключён и либо играет, либо пауза, либо только
- *     что доиграл трек с текущим label (LOADING — переходное).
- *   - canPrevious — есть past-стек (live) или сессионная история (idle).
- *   - canSkipForward — очередь, ∞, или есть idle-tail (прыжок вперёд).
+ *     что доиграл трек с текущим label (LOADING — переходное). Гейтит pause/resume,
+ *     repeat, autoplay, like (всё что теряет смысл без «активного» трека).
+ *
+ *   - canPrevious — ОТДЕЛЁН от hasActiveTrack. Семантика «назад по истории»:
+ *       - playing/paused → pastLen > 0 (реальный стек предыдущих треков)
+ *       - idle в войсе   → sessLen > 0 (сессионная история после доигрывания)
+ *     repeat НЕ даёт shortcut'а: на первом треке с repeat prev остаётся
+ *     disabled, даже хотя previousTrack() technically может перезапустить
+ *     текущий трек. Пользователь воспринимает prev как «назад», не «рестарт».
+ *     Блокируется во время LOADING-перехода.
+ *
+ *   - canSkipForward — (playing ‖ paused) && (очередь / ∞ / idle-tail). На
+ *     паузе skip авто-resume'ит через playNext после stopPlayer → Idle.
+ *
+ *   - canRepeatToggle — ТОЛЬКО при активном треке (playing/paused). Семантика
+ *     «повтори этот трек» требует контекста трека; без него toggle — шум для
+ *     UX (пользователь смотрит на подсвеченную кнопку и не понимает что она
+ *     делает). В IDLE_EMPTY/IDLE_EXHAUSTED/LOADING — disabled.
+ *
+ *   - canAutoplayToggle — playing/paused ИЛИ IDLE_EXHAUSTED в войсе.
+ *     IDLE_EXHAUSTED имеет осмысленный pre-arm: «только что доиграл — ∞ ON →
+ *     продолжи станцию одним кликом». В IDLE_EMPTY (только что зашли в войс,
+ *     никогда ничего не играло) pre-arm бесполезен — всё равно /play нужен,
+ *     после старта можно включить ∞.
+ *
+ *   - canLike — enabled когда hasActiveTrack ИЛИ IDLE_EXHAUSTED + в
+ *     currentPlayingLabelByGuild ещё помнится последний трек («ретроспективный
+ *     лайк» сразу после доигрывания, до teardown'а).
+ *
  *   - loading — плеер в состоянии resolving URL / ждёт voice ready.
  *   - paused — player в Paused/AutoPaused.
  *
@@ -535,6 +561,9 @@ export function isGuildPlayingMusic(guildId) {
  *   paused: boolean,
  *   canPrevious: boolean,
  *   canSkipForward: boolean,
+ *   canRepeatToggle: boolean,
+ *   canAutoplayToggle: boolean,
+ *   canLike: boolean,
  *   repeat: boolean,
  *   autoplay: boolean,
  *   loading: boolean,
@@ -548,22 +577,54 @@ export function getMusicTransportState(guildId) {
   const paused = statusStr === 'paused' || statusStr === 'autopaused';
   const playing = isPlayerPlaying(id);
   const loading = playerState === PlayerState.LOADING;
+  const inVoice = isConnectionAlive(id);
 
-  const hasActiveTrack = (playing || paused || loading) && isConnectionAlive(id);
+  const hasActiveTrack = (playing || paused || loading) && inVoice;
 
   const pastLen = getPastTrackUrls(id).length;
   const sessLen = getSessionPlayedWatchUrls(id).length;
-  const canPrevious = hasActiveTrack && (pastLen > 0 || sessLen > 0);
 
-  const canSkipForward = hasActiveTrack && (
-    playing && (getQueueLength(id) > 0 || autoplayByGuild.has(id) || getIdleBackForwardTail(id) != null)
-  );
+  let canPrevious = false;
+  if (inVoice && !loading) {
+    if (playing || paused) {
+      canPrevious = pastLen > 0;
+    } else {
+      canPrevious = sessLen > 0;
+    }
+  }
+
+  const canSkipForward =
+    (playing || paused) && inVoice && !loading && (
+      getQueueLength(id) > 0 ||
+      autoplayByGuild.has(id) ||
+      getIdleBackForwardTail(id) != null
+    );
+
+  // ↻ repeat — только при активном треке (нет смысла без контекста).
+  // ∞ autoplay — активный трек ИЛИ IDLE_EXHAUSTED в войсе (pre-arm
+  // «продолжи станцию» после доигрывания). См. доку выше про семантику.
+  const canRepeatToggle = (playing || paused) && inVoice && !loading;
+  const canAutoplayToggle =
+    !loading &&
+    inVoice &&
+    (playing || paused || playerState === PlayerState.IDLE_EXHAUSTED);
+
+  // Ретроспективный лайк: IDLE_EXHAUSTED пока currentPlayingLabelByGuild
+  // ещё помнит последний трек (до stopAndLeave полного teardown'а).
+  const hasRememberedTrack =
+    playerState === PlayerState.IDLE_EXHAUSTED &&
+    inVoice &&
+    currentPlayingLabelByGuild.has(id);
+  const canLike = hasActiveTrack || hasRememberedTrack;
 
   return {
     hasActiveTrack,
     paused,
     canPrevious,
     canSkipForward,
+    canRepeatToggle,
+    canAutoplayToggle,
+    canLike,
     repeat: repeatByGuild.has(id),
     autoplay: autoplayByGuild.has(id),
     loading,

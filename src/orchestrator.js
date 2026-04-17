@@ -39,6 +39,8 @@ import {
   stopAndLeave as musicStopAndLeave,
 } from './music.js';
 
+import { scheduleCommand } from './command-queue.js';
+
 /**
  * @typedef {'user_leave' | 'connection_destroy' | 'connection_disconnect' | 'timeout' | 'unknown'} VoiceGoneReason
  */
@@ -99,11 +101,19 @@ function normalizeGuildId(guildId) {
 /**
  * Внешний use-case API. Каждая команда:
  *   - идемпотентна по возможности (повторный skip не ломает состояние);
- *   - возвращает `Result<T>` с машинным `code` при ошибке;
+ *   - возвращает `Promise<Result<T>>` с машинным `code` при ошибке;
  *   - не бросает — любой Error от нижнего слоя заворачивается в Err.
  *
- * Форма сделана «будто бы вызывается через per-guild Promise-chain» — mutex
- * сейчас не реализован, но API готов к его появлению без breaking change.
+ * Per-guild сериализация: все команды для одной гильдии идут через
+ * `scheduleCommand` (command-queue.js) — Promise-chain, как для UI-обновлений.
+ * Два юзера жмут кнопки одновременно → их команды выполняются строго
+ * последовательно, не гоняются за мутацию одного и того же state'а.
+ *
+ * ВАЖНО для вызывающих: теперь ВСЕ команды async. Нужен `await`, иначе
+ * панель обновится раньше чем команда реально отработает и покажет
+ * устаревшее состояние.
+ *
+ * Команды РАЗНЫХ гильдий параллельны — per-guild очереди независимы.
  */
 export const commands = Object.freeze({
   /**
@@ -122,116 +132,128 @@ export const commands = Object.freeze({
     if (!payload || !payload.channel) return fail('channel required', 'invalid_argument');
     const query = typeof payload.query === 'string' ? payload.query.trim() : '';
     if (!query) return fail('query required', 'invalid_argument');
-    log('commands.enqueue', payload.channel.guild?.id, { source: payload.source ?? 'single' });
-    try {
-      const r = await musicEnqueue(
-        payload.channel,
-        query,
-        payload.source ?? 'single',
-        payload.userId ?? null,
-        payload.userDisplayName ?? null,
-      );
-      return okValue({
-        panelHint: r?.panelHint ?? '',
-        trackLabel: r?.trackLabel ?? '',
-      });
-    } catch (e) {
-      const reason = e instanceof Error ? e.message : String(e);
-      return fail(reason, 'enqueue_error');
-    }
+    const gid = payload.channel.guild?.id;
+    if (!gid) return fail('channel has no guild', 'invalid_argument');
+    log('commands.enqueue', gid, { source: payload.source ?? 'single' });
+    return scheduleCommand(gid, async () => {
+      try {
+        const r = await musicEnqueue(
+          payload.channel,
+          query,
+          payload.source ?? 'single',
+          payload.userId ?? null,
+          payload.userDisplayName ?? null,
+        );
+        return okValue({
+          panelHint: r?.panelHint ?? '',
+          trackLabel: r?.trackLabel ?? '',
+        });
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : String(e);
+        return fail(reason, 'enqueue_error');
+      }
+    });
   },
 
   /**
    * Пропустить текущий трек.
    * @param {string | null | undefined} guildId
    * @param {string | null} [actorUserId]
-   * @returns {Result<void>}
+   * @returns {Promise<Result<void>>}
    */
-  skip(guildId, actorUserId = null) {
+  async skip(guildId, actorUserId = null) {
     const id = normalizeGuildId(guildId);
     if (!id) return fail('guildId required', 'invalid_argument');
     log('commands.skip', id, { actorUserId });
-    const ok = musicSkip(id, actorUserId);
-    return ok ? OK : fail('no active player', 'not_playing');
+    return scheduleCommand(id, () => {
+      const ok = musicSkip(id, actorUserId);
+      return ok ? OK : fail('no active player', 'not_playing');
+    });
   },
 
   /**
    * Перейти на предыдущий трек сессии.
    * @param {string | null | undefined} guildId
    * @param {string | null} [actorUserId]
-   * @returns {Result<void>}
+   * @returns {Promise<Result<void>>}
    */
-  previousTrack(guildId, actorUserId = null) {
+  async previousTrack(guildId, actorUserId = null) {
     const id = normalizeGuildId(guildId);
     if (!id) return fail('guildId required', 'invalid_argument');
     log('commands.previousTrack', id, { actorUserId });
-    const ok = musicPreviousTrack(id, actorUserId);
-    return ok ? OK : fail('no history or not connected', 'no_history');
+    return scheduleCommand(id, () => {
+      const ok = musicPreviousTrack(id, actorUserId);
+      return ok ? OK : fail('no history or not connected', 'no_history');
+    });
   },
 
   /**
    * Пауза.
    * @param {string | null | undefined} guildId
-   * @returns {Result<void>}
+   * @returns {Promise<Result<void>>}
    */
-  pause(guildId) {
+  async pause(guildId) {
     const id = normalizeGuildId(guildId);
     if (!id) return fail('guildId required', 'invalid_argument');
     log('commands.pause', id);
-    const ok = musicPause(id);
-    return ok ? OK : fail('pause not applicable', 'not_applicable');
+    return scheduleCommand(id, () => {
+      const ok = musicPause(id);
+      return ok ? OK : fail('pause not applicable', 'not_applicable');
+    });
   },
 
   /**
    * Снять паузу.
    * @param {string | null | undefined} guildId
-   * @returns {Result<void>}
+   * @returns {Promise<Result<void>>}
    */
-  resume(guildId) {
+  async resume(guildId) {
     const id = normalizeGuildId(guildId);
     if (!id) return fail('guildId required', 'invalid_argument');
     log('commands.resume', id);
-    const ok = musicResume(id);
-    return ok ? OK : fail('resume not applicable', 'not_applicable');
+    return scheduleCommand(id, () => {
+      const ok = musicResume(id);
+      return ok ? OK : fail('resume not applicable', 'not_applicable');
+    });
   },
 
   /**
    * Переключить repeat (взаимоисключающ с autoplay). Возвращает новое состояние.
    * @param {string | null | undefined} guildId
-   * @returns {Result<{ enabled: boolean }>}
+   * @returns {Promise<Result<{ enabled: boolean }>>}
    */
-  toggleRepeat(guildId) {
+  async toggleRepeat(guildId) {
     const id = normalizeGuildId(guildId);
     if (!id) return fail('guildId required', 'invalid_argument');
     log('commands.toggleRepeat', id);
-    const enabled = musicToggleRepeat(id);
-    return okValue({ enabled });
+    return scheduleCommand(id, () => okValue({ enabled: musicToggleRepeat(id) }));
   },
 
   /**
    * Переключить autoplay (взаимоисключающ с repeat). Возвращает новое состояние.
    * @param {string | null | undefined} guildId
-   * @returns {Result<{ enabled: boolean }>}
+   * @returns {Promise<Result<{ enabled: boolean }>>}
    */
-  toggleAutoplay(guildId) {
+  async toggleAutoplay(guildId) {
     const id = normalizeGuildId(guildId);
     if (!id) return fail('guildId required', 'invalid_argument');
     log('commands.toggleAutoplay', id);
-    const enabled = musicToggleAutoplay(id);
-    return okValue({ enabled });
+    return scheduleCommand(id, () => okValue({ enabled: musicToggleAutoplay(id) }));
   },
 
   /**
    * Полный стоп + выход из голосового канала.
    * @param {string | null | undefined} guildId
-   * @returns {Result<void>}
+   * @returns {Promise<Result<void>>}
    */
-  stopAndLeave(guildId) {
+  async stopAndLeave(guildId) {
     const id = normalizeGuildId(guildId);
     if (!id) return fail('guildId required', 'invalid_argument');
     log('commands.stopAndLeave', id);
-    musicStopAndLeave(id);
-    return OK;
+    return scheduleCommand(id, () => {
+      musicStopAndLeave(id);
+      return OK;
+    });
   },
 });
 
