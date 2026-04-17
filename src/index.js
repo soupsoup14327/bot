@@ -34,7 +34,7 @@ import {
 } from 'discord.js';
 import sodium from 'libsodium-wrappers';
 
-import { chatOllama } from './ollama.js';
+import { chatGroq } from './groq.js';
 import { registerAutoplayUserQuery } from './music.js';
 import { orchestrator } from './orchestrator.js';
 import {
@@ -250,7 +250,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'chat') {
       await interaction.deferReply();
       const text = interaction.options.getString('text', true);
-      const reply = await chatOllama(text, SYSTEM);
+      const reply = await chatGroq(text, SYSTEM);
       await interaction.editReply(String(reply ?? '').slice(0, 3900));
       return;
     }

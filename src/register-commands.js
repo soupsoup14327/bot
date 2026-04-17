@@ -13,7 +13,7 @@ if (!token || !clientId) {
 const commands = [
   new SlashCommandBuilder()
     .setName('chat')
-    .setDescription('Спросить локальную Llama (Ollama)')
+    .setDescription('Спросить ИИ (Groq)')
     .addStringOption((o) =>
       o.setName('text').setDescription('Текст').setRequired(true),
     )

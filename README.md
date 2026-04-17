@@ -1,4 +1,4 @@
-# Discord bot: Ollama (Llama), YouTube music, картинки
+# Discord bot: Groq (ИИ), YouTube music, картинки
 
 ## Важно про токен
 
@@ -6,7 +6,7 @@
 
 ## Что умеет
 
-- `/chat` — ответ через локальную **Ollama** (по умолчанию `llama3.1:8b`).
+- `/chat` — ответ через **Groq** (модель по умолчанию — `llama-3.3-70b-versatile`, меняется `GROQ_CHAT_MODEL`).
 - `/play` — очередь музыки с **YouTube** (поиск или ссылка); зайди в голосовой канал перед командой.
 - `/image` — картинка по тексту через [image.pollinations.ai](https://image.pollinations.ai/) (без API-ключа).
 - `/skip`, `/stop`.
@@ -14,32 +14,24 @@
 ## Требования
 
 - Node.js 18+
-- Запущенный **Ollama** и скачанная модель (см. ниже).
+- `GROQ_API_KEY` из [console.groq.com](https://console.groq.com/) (бесплатный tier достаточно).
 - Для музыки: боту в Discord выданы права **Connect**, **Speak**, **Use Voice Activity** (и базовые для slash-команд).
-
-## Установка Ollama и модели (Windows)
-
-1. Установи [Ollama для Windows](https://ollama.com/download) (или через `winget install Ollama.Ollama`).
-2. В терминале:
-
-```bash
-ollama pull llama3.1:8b
-```
-
-3. Убедись, что сервер доступен: `http://127.0.0.1:11434` (Ollama обычно стартует в фоне после установки).
 
 ## Настройка бота
 
-1. Скопируй `.env.example` в `.env`.
+1. Скопируй `.env.example` в `.env` (или `npm run env:setup`).
 2. Заполни `DISCORD_TOKEN` (новый, после сброса при утечке).
 3. `DISCORD_CLIENT_ID` — **Application ID** из вкладки OAuth2 / General.
-4. Опционально `DISCORD_GUILD_ID` — ID сервера для **быстрой** регистрации slash-команд (иначе глобальные команды могут обновляться до ~1 часа).
+4. `GROQ_API_KEY` — из Groq Console.
+5. Опционально `DISCORD_GUILD_ID` — ID сервера для **быстрой** регистрации slash-команд (иначе глобальные команды могут обновляться до ~1 часа).
 
 ```bash
 npm install
 npm run register-commands
 npm start
 ```
+
+Полный список env-переменных — `docs/ПЕРЕМЕННЫЕ.md`.
 
 ## Пуш на GitHub
 

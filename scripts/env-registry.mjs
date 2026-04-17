@@ -10,8 +10,6 @@ export const ENV_REGISTRY = [
   { name: 'DISCORD_CLIENT_ID', category: 'core', type: 'string', required: false, description: 'Application ID for slash command registration.' },
   { name: 'DISCORD_GUILD_ID', category: 'core', type: 'string', required: false, description: 'Guild id or comma-separated guild ids for fast command sync.' },
   { name: 'DISCORD_KEEP_GLOBAL_COMMANDS', category: 'core', type: 'bool01', defaultValue: '0', required: false, description: 'Keep global slash commands when guild-scoped registration is enabled.' },
-  { name: 'OLLAMA_URL', category: 'core', type: 'url', required: false, description: 'Ollama HTTP API base URL (legacy template bot).' },
-  { name: 'OLLAMA_MODEL', category: 'core', type: 'string', required: false, description: 'Ollama model name (legacy template bot).' },
 
   // Metrics and observability
   { name: 'METRICS_TXT_ENABLED', category: 'metrics', type: 'bool01', defaultValue: '1', required: false, description: 'Enable metrics writes to data/metrics/*.txt.' },

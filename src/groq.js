@@ -705,7 +705,7 @@ export async function groqNextTrackQuery(seedQuery, playedTitles, opts = {}) {
 // ─── Chat ─────────────────────────────────────────────────────────────────────
 
 /**
- * General-purpose Groq chat (replaces chatOllama).
+ * General-purpose Groq chat (used by /chat).
  *
  * @param {string} userText
  * @param {string} [systemPrompt]
