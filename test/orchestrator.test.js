@@ -15,6 +15,7 @@ import { test, describe, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { orchestrator, commands, events } from '../src/orchestrator.js';
 import {
+  currentQueueItemByGuild,
   endSession,
   getGuildSessionSnapshot,
   getSessionId,
@@ -197,5 +198,17 @@ describe('orchestrator.events voice lifecycle (Шаг 5)', () => {
     assert.doesNotThrow(() => events.onVoiceGone(GID, 'timeout'));
     assert.doesNotThrow(() => events.onVoiceGone(GID, 'connection_destroy'));
     assert.equal(getSessionId(GID), null);
+  });
+
+  test('getGuildSessionSnapshot exposes current autoplay spawn id when present', () => {
+    events.onVoiceReady(GID, 'channel-99');
+    currentQueueItemByGuild.set(GID, {
+      url: 'https://www.youtube.com/watch?v=abc123defgh',
+      source: 'autoplay',
+      spawnId: 'spawn:test-session:42',
+      title: 'Test title',
+    });
+    const snap = getGuildSessionSnapshot(GID);
+    assert.equal(snap.currentTrackSpawnId, 'spawn:test-session:42');
   });
 });

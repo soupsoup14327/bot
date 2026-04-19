@@ -45,6 +45,15 @@ import {
   pushAutoplayUsedQuery,
   buildAutoplayPivotSeed,
 } from './autoplay-session-state.js';
+import {
+  attachAutoplayEscapeSpawnId,
+  consumeAutoplayEscapeDFallbackPending,
+  getAutoplayEscapeSnapshot,
+} from './autoplay-escape-state.js';
+import {
+  isAutoplayEscapeContrastActivePhase,
+  resolveAutoplayEscapeRetrievalOverride,
+} from './autoplay-escape-retrieval.js';
 import { buildAutoplaySpawnContext } from './autoplay-spawn-context.js';
 import {
   bumpAutoplaySpawnGeneration,
@@ -68,6 +77,13 @@ import {
   detectDominantArtist,
   extractLeadArtistTokenFromTitle as extractLeadArtistToken,
 } from './autoplay-artist-tokens.js';
+import {
+  consumeAutoplayArtistQuarantineSpawn,
+  filterAutoplayCandidatesByArtistQuarantine,
+  isAutoplayArtistQuarantineEnabled,
+  isArtistQuarantined,
+} from './autoplay-artist-quarantine.js';
+import { buildDistinctArtistShortlist } from './autoplay-distinct-artists.js';
 import { baselineGroqCall } from './autoplay-baseline.js';
 import { pickAutoplayRetrieval } from './autoplay-engine.js';
 import { rankAutoplayCandidates } from './candidate-ranker.js';
@@ -86,6 +102,128 @@ import {
   pickTracksForArtist,
 } from './youtube-search.js';
 import { getPoolSize, popBestCandidate, storeSurplus } from './autoplay-prefetch.js';
+
+function buildAutoplaySpawnId(sessionId, spawnGen) {
+  return `spawn:${String(sessionId ?? 'no-session')}:${Number(spawnGen)}`;
+}
+
+/**
+ * Escape trial/provisional and one-shot D fallback must always go through the
+ * engine retrieval path. Prefetch pool candidates were produced from an older
+ * context and would skip the contrast/D override if consumed directly.
+ *
+ * @param {import('./autoplay-escape-state.js').AutoplayEscapeSnapshot | null | undefined} escapeSnapshot
+ * @returns {boolean}
+ */
+export function shouldBypassAutoplayPrefetchFastPath(escapeSnapshot) {
+  return (
+    Boolean(escapeSnapshot?.dFallbackPending)
+    || (
+      (escapeSnapshot?.prefetchMode ?? 'normal') !== 'normal'
+      && isAutoplayEscapeContrastActivePhase(escapeSnapshot?.phase ?? null)
+    )
+  );
+}
+
+/**
+ * Confirmed escape branches add one secondary positive anchor back into the
+ * normal retrieval path. Trial/provisional still rely on contrast override and
+ * must not extend the regular positive context.
+ *
+ * @param {string[]} positiveCtx
+ * @param {import('./autoplay-escape-state.js').AutoplayEscapeSnapshot | null | undefined} escapeSnapshot
+ * @returns {string[]}
+ */
+export function buildAutoplayRetrievalPositiveContext(positiveCtx, escapeSnapshot) {
+  if (
+    escapeSnapshot?.phase !== 'confirmed'
+    || !Array.isArray(escapeSnapshot.confirmedAnchors)
+    || escapeSnapshot.confirmedAnchors.length === 0
+  ) {
+    return positiveCtx;
+  }
+  return [...positiveCtx, ...escapeSnapshot.confirmedAnchors];
+}
+
+/**
+ * Compact escape telemetry payload attached to autoplay-spawn metrics.
+ *
+ * @param {import('./autoplay-escape-state.js').AutoplayEscapeSnapshot | null | undefined} escapeSnapshot
+ * @param {{ mode?: string | null } | null | undefined} retrievalMode
+ * @returns {{
+ *   phase: string | null,
+ *   mode: string,
+ *   branchId: string | null,
+ *   confirmedAnchorsCount: number,
+ *   dFallbackUsed: boolean,
+ *   cooldownRemaining: number,
+ * }}
+ */
+export function buildAutoplaySpawnEscapeTelemetry(escapeSnapshot, retrievalMode) {
+  return {
+    phase: escapeSnapshot?.phase ?? null,
+    mode: typeof retrievalMode?.mode === 'string' && retrievalMode.mode.trim()
+      ? retrievalMode.mode.trim()
+      : 'normal',
+    branchId: escapeSnapshot?.branchId ?? null,
+    confirmedAnchorsCount: Array.isArray(escapeSnapshot?.confirmedAnchors)
+      ? escapeSnapshot.confirmedAnchors.length
+      : 0,
+    dFallbackUsed: retrievalMode?.mode === 'd_fallback',
+    cooldownRemaining: Math.max(0, Number(escapeSnapshot?.cooldownSpawnsRemaining) || 0),
+  };
+}
+
+/**
+ * Consume pool candidates until we find one whose artist is not quarantined.
+ * Quarantined pool hits are intentionally discarded: they were generated from
+ * an older context and must not immediately resurface after a quick skip.
+ *
+ * @param {{
+ *   popCandidate: () => any | null,
+ *   quarantinedArtists: Iterable<string> | null | undefined,
+ *   extractLeadArtistToken: (title: string, meta?: { channelName?: string | null } | null) => string | null,
+ *   maxAttempts?: number,
+ * }} p
+ * @returns {{ candidate: any | null, rejectedByArtistQuarantine: number }}
+ */
+export function pickAutoplayPrefetchCandidateRespectingArtistQuarantine(p) {
+  const popCandidate = typeof p?.popCandidate === 'function' ? p.popCandidate : (() => null);
+  const maxAttempts = Math.max(1, Number(p?.maxAttempts) || 24);
+  const extractArtist = typeof p?.extractLeadArtistToken === 'function'
+    ? p.extractLeadArtistToken
+    : (() => null);
+
+  let rejectedByArtistQuarantine = 0;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const candidate = popCandidate();
+    if (!candidate) {
+      return {
+        candidate: null,
+        rejectedByArtistQuarantine,
+      };
+    }
+
+    const artist = extractArtist(
+      String(candidate?.title ?? ''),
+      { channelName: candidate?.channel?.name ?? null },
+    );
+    if (isArtistQuarantined(p?.quarantinedArtists ?? [], artist)) {
+      rejectedByArtistQuarantine++;
+      continue;
+    }
+
+    return {
+      candidate,
+      rejectedByArtistQuarantine,
+    };
+  }
+
+  return {
+    candidate: null,
+    rejectedByArtistQuarantine,
+  };
+}
 
 /**
  * Автоплей: не ставить тот же watch URL, что сейчас числится как «играющий» или
@@ -130,6 +268,52 @@ export function createAutoplaySpawnStaleGuard(p) {
     p.logSpawn(outcome, { detail: String(staleReason) });
     return true;
   };
+}
+
+/**
+ * Prepare retrieval mode for a concrete spawn after the prefetch fast-path has
+ * already had a chance to short-circuit. This keeps `currentSpawnId`
+ * synchronized with the actual spawn id that goes through the engine path.
+ *
+ * @param {{
+ *   guildId: string,
+ *   spawnId: string,
+ *   escapeSnapshot: import('./autoplay-escape-state.js').AutoplayEscapeSnapshot,
+ *   seedQuery: string,
+ *   effectiveSeed: string,
+ *   pivotToAnchor: boolean,
+ *   lastIntent: string | null,
+ *   initialSeed: string | null,
+ *   topic: string | null,
+ *   identityIntent: string | null,
+ *   currentPlayingLabel: string | null,
+ * }} p
+ */
+export function prepareAutoplayRetrievalModeForSpawn(p) {
+  const useDFallback = consumeAutoplayEscapeDFallbackPending(p.guildId);
+  if (isAutoplayEscapeContrastActivePhase(p.escapeSnapshot.phase)) {
+    attachAutoplayEscapeSpawnId(p.guildId, p.spawnId);
+    autoplayDebug(p.guildId, 'escape-retrieval', {
+      phase: p.escapeSnapshot.phase,
+      from: p.escapeSnapshot.contrastHint?.from ?? null,
+      anchor: p.escapeSnapshot.contrastHint?.anchor ?? null,
+      spawnId: p.spawnId,
+    });
+  }
+
+  return resolveAutoplayEscapeRetrievalOverride({
+    escapeSnapshot: p.escapeSnapshot,
+    seedQuery: String(p.seedQuery),
+    currentPlayingLabel: p.currentPlayingLabel,
+    effectiveSeed: String(p.effectiveSeed),
+    pivotToAnchor: p.pivotToAnchor,
+    lastIntent: p.lastIntent,
+    initialSeed: p.initialSeed,
+    topic: p.topic,
+    identityIntent: p.identityIntent,
+    currentPlayingLabelForRetrieval: p.currentPlayingLabel,
+    useDFallback,
+  });
 }
 
 /**
@@ -206,6 +390,12 @@ async function _spawnAutoplayPlaylistImpl(id, seedQuery, deps) {
     buildAutoplayPivotSeed,
   });
   const mySpawnGen = bumpAutoplaySpawnGeneration(id);
+  const sessionId = getSessionId(id) ?? '';
+  const spawnId = buildAutoplaySpawnId(sessionId, mySpawnGen);
+  const escapeSnapshot = getAutoplayEscapeSnapshot(id);
+  const quarantinedArtists = isAutoplayArtistQuarantineEnabled()
+    ? consumeAutoplayArtistQuarantineSpawn(id)
+    : [];
   const staleCtx = {
     isConnectionAlive: (gid) => isConnectionAlive(gid),
     isPlaying: (gid) => isPlayerPlaying(gid),
@@ -225,20 +415,25 @@ async function _spawnAutoplayPlaylistImpl(id, seedQuery, deps) {
     negativeCtx: negativeCtx.length,
     usedQueries: usedQueries.length,
   });
-
   // ─── Prefetch pool fast path ──────────────────────────────────────────────
   // If a previous spawn stored surplus candidates, use the pool to skip the
   // full Groq + YouTube search pipeline. Only bypasses retrieval — all
   // stale/connection guards still apply after popping from the pool.
-  {
-    const prefetchCandidate = popBestCandidate(id, {
-      sessionId: getSessionId(id) ?? '',
-      generation: getPrefetchGeneration(id),
+  if (!shouldBypassAutoplayPrefetchFastPath(escapeSnapshot)) {
+    const prefetchSelection = pickAutoplayPrefetchCandidateRespectingArtistQuarantine({
+      popCandidate: () => popBestCandidate(id, {
+        sessionId,
+        generation: getPrefetchGeneration(id),
+      }),
+      quarantinedArtists,
+      extractLeadArtistToken,
     });
+    const prefetchCandidate = prefetchSelection.candidate;
     if (prefetchCandidate) {
       autoplayDebug(id, 'prefetch-hit', {
         title: prefetchCandidate.title?.slice(0, 80) ?? null,
         poolSizeAfter: getPoolSize(id),
+        rejectedByArtistQuarantine: prefetchSelection.rejectedByArtistQuarantine,
       });
       if (!isConnectionAlive(id)) {
         return 'skip';
@@ -252,7 +447,13 @@ async function _spawnAutoplayPlaylistImpl(id, seedQuery, deps) {
         autoplayDebug(id, 'prefetch-recent-blocked', { url: prefetchCandidate.url });
         console.log(`[prefetch] pool_hit blocked by recent guard — fall through guild=${id}`);
         // continue to full spawn below (don't return 'skip' — pool may have had the only candidate)
-      } else if (!enqueueTrackIfNotQueued(id, { url: prefetchCandidate.url, source: 'autoplay', title: prefetchCandidate.title ?? null })) {
+      } else if (!enqueueTrackIfNotQueued(id, {
+        url: prefetchCandidate.url,
+        source: 'autoplay',
+        spawnId: prefetchCandidate.spawnId ?? null,
+        title: prefetchCandidate.title ?? null,
+        channelName: prefetchCandidate.channel?.name ?? prefetchCandidate.channelName ?? null,
+      })) {
         autoplayDebug(id, 'prefetch-dedup', { url: prefetchCandidate.url });
         // dedup: item already in queue — fall through to full engine
       } else {
@@ -263,6 +464,12 @@ async function _spawnAutoplayPlaylistImpl(id, seedQuery, deps) {
         recordAutoplaySpawnSuccess(id);
         return 'queued';
       }
+    } else if (prefetchSelection.rejectedByArtistQuarantine > 0) {
+      autoplayDebug(id, 'prefetch-hit', {
+        title: null,
+        poolSizeAfter: getPoolSize(id),
+        rejectedByArtistQuarantine: prefetchSelection.rejectedByArtistQuarantine,
+      });
     }
   }
 
@@ -270,6 +477,23 @@ async function _spawnAutoplayPlaylistImpl(id, seedQuery, deps) {
    * Serverside query-hints: fire-and-forget, timeout внутри syncAndGetHints.
    * При любой ошибке hints = [], поиск идёт без изменений.
    */
+  const retrievalMode = prepareAutoplayRetrievalModeForSpawn({
+    guildId: id,
+    spawnId,
+    escapeSnapshot,
+    seedQuery: String(seedQuery),
+    effectiveSeed: String(effectiveSeed),
+    pivotToAnchor,
+    lastIntent,
+    initialSeed,
+    topic: session.topicIntent,
+    identityIntent: session.identityIntent,
+    currentPlayingLabel: currentPlayingLabelByGuild.get(id) ?? null,
+  });
+  const retrievalPositiveCtx = buildAutoplayRetrievalPositiveContext(
+    positiveCtx,
+    escapeSnapshot,
+  );
   const serverHints = await syncAndGetHints(id);
   /** Подсказки с сервера: при METRICS_TXT — bridge.txt (recommendation-bridge); дублировать здесь не нужно. */
   autoplayDebug(id, 'server-hints', { count: serverHints.length });
@@ -284,20 +508,22 @@ async function _spawnAutoplayPlaylistImpl(id, seedQuery, deps) {
     await pickAutoplayRetrieval(
     {
       guildId: id,
-      effectiveSeed: String(effectiveSeed),
-      pivotToAnchor,
+      effectiveSeed: retrievalMode.effectiveSeed,
+      pivotToAnchor: retrievalMode.pivotToAnchor,
       playedTitles,
-      positiveCtx,
+      positiveCtx: retrievalPositiveCtx,
       negativeCtx,
       usedQueries,
-      lastIntent,
-      initialSeed,
-      topic: session.topicIntent,
-      identityIntent: session.identityIntent,
+      lastIntent: retrievalMode.lastIntent,
+      initialSeed: retrievalMode.initialSeed,
+      topic: retrievalMode.topic,
+      identityIntent: retrievalMode.identityIntent,
       sessionTitlesForFast,
       alternateStreakFast,
-      currentPlayingLabel: currentPlayingLabelByGuild.get(id) ?? null,
+      currentPlayingLabel: retrievalMode.currentPlayingLabel,
       serverHints,
+      escapeContrastHint: retrievalMode.escapeContrastHint,
+      dFallbackPrompt: retrievalMode.dFallbackPrompt ?? null,
     },
     {
       onGroqCall: () => baselineGroqCall(id),
@@ -315,6 +541,10 @@ async function _spawnAutoplayPlaylistImpl(id, seedQuery, deps) {
     telemetry: retrievalTelemetry ?? {},
     groqTrace,
   };
+  const escapeTelemetry = buildAutoplaySpawnEscapeTelemetry(
+    escapeSnapshot,
+    retrievalMode,
+  );
   const logSpawn = (outcome, extra = {}) => {
     logAutoplaySpawn({
       guildId: id,
@@ -324,6 +554,7 @@ async function _spawnAutoplayPlaylistImpl(id, seedQuery, deps) {
       usedToken: retrievalSnap.usedToken,
       telemetry: retrievalSnap.telemetry,
       policyMeta: retrievalSnap.policy?.meta ?? null,
+      escape: escapeTelemetry,
       ...extra,
     });
   };
@@ -374,7 +605,20 @@ async function _spawnAutoplayPlaylistImpl(id, seedQuery, deps) {
       idx: i,
       returned: set.length,
     })));
-    const { pickedResultIdx, items } = pickFirstNonEmptyResultSet(resultSets);
+    const { pickedResultIdx, items: rawItems } = pickFirstNonEmptyResultSet(resultSets);
+    const quarantineFilter = filterAutoplayCandidatesByArtistQuarantine(rawItems, {
+      quarantinedArtists,
+      extractLeadArtistToken,
+    });
+    autoplayDebug(id, 'artist-quarantine', quarantineFilter.meta);
+    const distinctShortlist = buildDistinctArtistShortlist(quarantineFilter.items, {
+      extractLeadArtistToken,
+    });
+    autoplayDebug(id, 'distinct-artists', distinctShortlist.meta);
+    const items = distinctShortlist.items.map((item) => ({
+      ...item,
+      spawnId,
+    }));
     autoplayDebug(id, 'selected-query-index', { idx: pickedResultIdx });
     if (!items.length) throw new Error('empty result');
 
@@ -413,6 +657,7 @@ async function _spawnAutoplayPlaylistImpl(id, seedQuery, deps) {
       isVarietyControllerEnabled,
       computeVarietyRankPenalty,
       rankAutoplayCandidates,
+      spawnId,
     });
     const {
       added,
@@ -519,7 +764,7 @@ async function _spawnAutoplayPlaylistImpl(id, seedQuery, deps) {
     if (surplus.length) {
       const newGen = incrementPrefetchGeneration(id);
       storeSurplus(id, {
-        sessionId: getSessionId(id) ?? '',
+        sessionId,
         generation: newGen,
         items: surplus,
       });
@@ -616,6 +861,7 @@ function pickFirstNonEmptyResultSet(resultSets) {
  *   isVarietyControllerEnabled: () => boolean,
  *   computeVarietyRankPenalty: (guildId: string, title: string) => number,
  *   rankAutoplayCandidates: (items: any[], opts: any) => any[],
+ *   spawnId: string,
  * }} p
  */
 function applyAutoplayCandidatesStep(p) {
@@ -660,7 +906,13 @@ function applyAutoplayCandidatesStep(p) {
       skippedArtistCooldown++;
       continue;
     }
-    if (p.queue.pushIfNotQueued({ url: it.url, source: 'autoplay', title: it.title ?? null })) {
+    if (p.queue.pushIfNotQueued({
+      url: it.url,
+      source: 'autoplay',
+      spawnId: p.spawnId,
+      title: it.title ?? null,
+      channelName: it.channel?.name ?? it.channelName ?? null,
+    })) {
       added++;
       pickedForNotify = it;
       break;

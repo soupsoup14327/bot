@@ -18,9 +18,11 @@ import { providerTrackIdFromUrl } from './track-provider.js';
  *   url: string,
  *   source: TrackSource,
  *   providerTrackId?: string | null,
+ *   spawnId?: string | null,
  *   requestedBy?: string | null,
  *   requestedByName?: string | null,
  *   title?: string | null,
+ *   channelName?: string | null,
  * }} QueueItem
  */
 

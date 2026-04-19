@@ -1,4 +1,4 @@
-﻿/**
+/**
  * METRICS:SIGNALS — буфер событий + data/signals.json (см. MUSIC_SIGNALS_*).
  * METRICS:TXT — при track_skipped дополнительно пишется skips.txt (playback-metrics.logSkip).
  * Док: docs/НАБЛЮДАЕМОСТЬ.md §6
@@ -74,6 +74,7 @@ const MAX_AGE_MS = Math.max(
  *   actor:          string | null,
  *   requestedBy:    string | null,
  *   triggeredBy:    TriggeredBy,
+ *   spawnId:        string | null,
  *   listenersCount: number,
  *   url:            string,
  *   title:          string,
@@ -95,6 +96,43 @@ export function sourceToTriggeredBy(source) {
 
 /** @type {Map<string, SignalEvent[]>} */
 const bufferByGuild = new Map();
+
+/**
+ * @param {string} guildId
+ * @param {unknown} raw
+ * @returns {SignalEvent | null}
+ */
+function normalizeSignalEvent(guildId, raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const event = /** @type {Record<string, unknown>} */ (raw);
+  if (typeof event.type !== 'string') return null;
+  if (typeof event.url !== 'string') return null;
+  if (typeof event.title !== 'string') return null;
+  if (typeof event.timestamp !== 'number' || !Number.isFinite(event.timestamp)) return null;
+
+  return {
+    type: /** @type {SignalType} */ (event.type),
+    guildId: String(event.guildId ?? guildId),
+    sessionId: event.sessionId == null ? null : String(event.sessionId),
+    actor: event.actor == null ? null : String(event.actor),
+    requestedBy: event.requestedBy == null ? null : String(event.requestedBy),
+    triggeredBy:
+      event.triggeredBy === 'autoplay' ||
+      event.triggeredBy === 'playlist' ||
+      event.triggeredBy === 'navigation'
+        ? event.triggeredBy
+        : 'user',
+    spawnId: event.spawnId == null ? null : String(event.spawnId),
+    listenersCount: Math.max(0, Number(event.listenersCount) || 0),
+    url: String(event.url),
+    title: String(event.title),
+    timestamp: Number(event.timestamp),
+    elapsedMs:
+      typeof event.elapsedMs === 'number' && Number.isFinite(event.elapsedMs)
+        ? event.elapsedMs
+        : null,
+  };
+}
 
 // ─── Disk persistence ─────────────────────────────────────────────────────────
 
@@ -128,6 +166,7 @@ function scheduleSave() {
 
 /**
  * Loads persisted events from disk on startup. Drops events older than MAX_AGE_MS.
+ * Events with missing/malformed fields are normalized or skipped via normalizeSignalEvent.
  * Silently skips if the file doesn't exist (first run).
  */
 async function loadFromDisk() {
@@ -139,7 +178,9 @@ async function loadFromDisk() {
     for (const [guildId, events] of Object.entries(data)) {
       if (!Array.isArray(events)) continue;
       // Keep only events within the age window; enforce buffer cap
-      const fresh = events.filter((e) => typeof e?.timestamp === 'number' && e.timestamp >= cutoff);
+      const fresh = events
+        .map((e) => normalizeSignalEvent(String(guildId), e))
+        .filter((e) => e && e.timestamp >= cutoff);
       const capped = fresh.slice(-BUFFER_CAP);
       if (capped.length) {
         bufferByGuild.set(String(guildId), capped);
@@ -178,6 +219,7 @@ export function isSignalsEnabled() {
  *   actor?:         string | null,
  *   requestedBy?:   string | null,
  *   triggeredBy?:   TriggeredBy,
+ *   spawnId?:       string | null,
  *   listenersCount?: number,
  *   url:            string,
  *   title:          string,
@@ -189,6 +231,7 @@ export function emitSignal(type, {
   actor = null,
   requestedBy = null,
   triggeredBy = 'user',
+  spawnId = null,
   listenersCount = 0,
   url,
   title,
@@ -216,19 +259,22 @@ export function emitSignal(type, {
     }
   }
 
-  buf.push({
+  const normalized = normalizeSignalEvent(id, {
     type,
     guildId: id,
     sessionId: sessionId ? String(sessionId) : null,
     actor: actor ? String(actor) : null,
     requestedBy: requestedBy ? String(requestedBy) : null,
     triggeredBy,
+    spawnId: spawnId ? String(spawnId) : null,
     listenersCount: Math.max(0, listenersCount),
     url: String(url),
     title: String(title),
     timestamp: now,
     elapsedMs,
   });
+  if (!normalized) return;
+  buf.push(normalized);
   /** Кольцевой буфер: убираем самые старые при переполнении. */
   if (buf.length > BUFFER_CAP) buf.splice(0, buf.length - BUFFER_CAP);
   bufferByGuild.set(id, buf);
@@ -290,6 +336,20 @@ export function clearSignalBuffer(guildId) {
 }
 
 /**
+ * Test helper: replace one guild buffer in memory without touching disk.
+ * @param {string} guildId
+ * @param {unknown[]} events
+ */
+export function __replaceSignalBufferForTests(guildId, events) {
+  const id = String(guildId);
+  const normalized = (Array.isArray(events) ? events : [])
+    .map((e) => normalizeSignalEvent(id, e))
+    .filter(Boolean)
+    .slice(-BUFFER_CAP);
+  bufferByGuild.set(id, normalized);
+}
+
+/**
  * Сводная статистика по последним сигналам гильдии — для recommendation-bridge.
  * Возвращает url → { started, finished, skipped, quickSkipped } счётчики.
  *
@@ -314,6 +374,29 @@ export function buildSignalStats(guildId) {
     stats.set(e.url, s);
   }
   return stats;
+}
+
+/**
+ * Миллисекунды между последним `track_started` для данного URL и «сейчас».
+ * Возвращает null, если track_started не найден в буфере (напр., бот только
+ * что стартанул и буфера нет, или трек уже вытеснен кольцом).
+ *
+ * Используется в `music.js::skip` чтобы отличить quick-skip от обычного skip
+ * БЕЗ дублирования логики, живущей в `emitSignal`.
+ *
+ * @param {string} guildId
+ * @param {string} url
+ * @returns {number | null}
+ */
+export function getElapsedSinceLastStart(guildId, url) {
+  const buf = bufferByGuild.get(String(guildId)) ?? [];
+  const needle = String(url);
+  for (let i = buf.length - 1; i >= 0; i--) {
+    if (buf[i].type === 'track_started' && buf[i].url === needle) {
+      return Date.now() - buf[i].timestamp;
+    }
+  }
+  return null;
 }
 
 /**

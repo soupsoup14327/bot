@@ -1,4 +1,4 @@
-﻿/**
+/**
  * music.js — facade над модульной музыкальной подсистемой (Шаг 10).
  *
  * После рефакторинга (Шаги 4..10) этот файл больше НЕ содержит ни state'а
@@ -71,7 +71,10 @@ import {
   repeatByGuild,
   getListenersCount,
   getSessionId,
+  incrementPrefetchGeneration,
+  setPlayerState,
   PlayerState,
+  StatusReason,
 } from './guild-session-state.js';
 import {
   setAutoplayInitialSeedIfAbsent,
@@ -81,6 +84,7 @@ import {
 import { invalidateAutoplaySpawn } from './autoplay-stale-guard.js';
 import { resetAutoplayRecoveryStreak } from './autoplay-recovery.js';
 import { clearVarietyState } from './autoplay-variety.js';
+import { clearPool, invalidatePool } from './autoplay-prefetch.js';
 import {
   clearIdleNavigationState,
   getIdleBackForwardTail,
@@ -97,18 +101,35 @@ import { stopWithNavigationSignal } from './navigation-stop-flow.js';
 import {
   clearSignalBuffer,
   emitSignal,
+  getElapsedSinceLastStart,
   sourceToTriggeredBy,
 } from './music-signals.js';
+import { getQuickSkipThresholdMs } from './playback-metrics.js';
 import { recordPlaybackHistory } from './playback-history.js';
 import { resetPlaybackMetricsSession } from './playback-metrics.js';
 import { sameYoutubeContent } from './queue-invariants.js';
+import { extractLeadArtistTokenFromTitle } from './autoplay-artist-tokens.js';
+import { maybeApplyAutoplayEscapeQuickSkipTransitions } from './autoplay-escape-lifecycle.js';
+import { maybeTriggerAutoplayEscapeTrialFromQuickSkip } from './autoplay-escape-trigger.js';
+import {
+  clearAutoplayEscapeState,
+} from './autoplay-escape-state.js';
+import {
+  clearArtistQuarantineState,
+  isAutoplayArtistQuarantineEnabled,
+  quarantineArtistForNextSpawns,
+} from './autoplay-artist-quarantine.js';
 import {
   detectProvider,
+  isDirectUrl,
   providerTrackIdFromUrl,
 } from './track-provider.js';
 import {
   resolvePlayerUIState,
 } from './guild-session-state.js';
+import {
+  resolveYoutubeCanonicalTitle,
+} from './youtube-search.js';
 import {
   clearStopAndLeaveRuntimeState,
   resetStopAndLeaveOperationalState,
@@ -179,6 +200,11 @@ export async function enqueue(
   const guildId = String(channel.guild.id);
   const normalizedSource = source === 'autoplay' || source === 'navigation' ? source : 'single';
 
+  if (normalizedSource === 'single') {
+    clearAutoplayEscapeState(guildId);
+    clearArtistQuarantineState(guildId);
+  }
+
   // 1. Player: создаём до соединения, чтобы voice-adapter мог subscribe.
   const player = ensurePlayer(guildId);
 
@@ -190,6 +216,17 @@ export async function enqueue(
   ensureGuildMusicState(guildId);
 
   // 4. Dedup identity + queue item.
+  let resolvedDirectTitle = null;
+  if (isDirectUrl(rawQuery)) {
+    try {
+      resolvedDirectTitle = await resolveYoutubeCanonicalTitle(rawQuery, rawQuery);
+    } catch (e) {
+      console.warn('[music] enqueue title resolve failed', e);
+    }
+  }
+
+  const presentation = buildEnqueueTrackPresentation(rawQuery, resolvedDirectTitle);
+
   /** @type {import('./queue-invariants.js').QueueItem} */
   const item = {
     url: rawQuery,
@@ -197,7 +234,7 @@ export async function enqueue(
     providerTrackId: providerTrackIdFromUrl(rawQuery),
     requestedBy: userId ?? null,
     requestedByName: userDisplayName ?? null,
-    title: null,
+    title: presentation.queueItemTitle,
   };
 
   const queueWasEmpty = getQueueLength(guildId) === 0 && !isPlayerPlaying(guildId);
@@ -210,6 +247,14 @@ export async function enqueue(
     setAutoplayLastIntent(guildId, rawQuery);
   }
 
+  // Явный пользовательский add сбрасывает prefetch-пул: контекст «чего мы
+  // сейчас слушаем» обновился, закэшированный кластер прошлой подборки уже
+  // не отражает текущую интенцию. Navigation не трогаем (skip/prev сами
+  // инвалидируют пул по своим правилам).
+  if (normalizedSource === 'single') {
+    invalidatePool(guildId, 'user_enqueue');
+  }
+
   // 6. Кто-то пришёл в канал — снимаем pending auto-leave, если он был.
   clearAutoLeaveTimer(guildId);
   try {
@@ -219,11 +264,19 @@ export async function enqueue(
   }
 
   // 7. Планируем следующий запуск через per-guild promise chain.
-  void schedulePlayNext(guildId, 'enqueue');
+  const playerStatus = getPlayerStatus(guildId);
+  const playerStatusStr = playerStatus?.toString?.() ?? '';
+  const paused = playerStatusStr === 'paused' || playerStatusStr === 'autopaused';
+  const { playerState } = resolvePlayerUIState(guildId);
+  const loading = playerState === PlayerState.LOADING;
+  const playing = isPlayerPlaying(guildId);
+  if (shouldKickPlaybackOnEnqueue({ playing, paused, loading })) {
+    void schedulePlayNext(guildId, 'enqueue');
+  }
 
   // 8. UI-хинт для панели. Если что-то уже играло — добавляем как "в очереди".
   //    Иначе — хинт пустой, music-panel возьмёт fragment из state (LOADING).
-  const trackLabel = rawQuery;
+  const trackLabel = presentation.trackLabel;
   const panelHint = queueWasEmpty ? '' : `В очереди: **${trackLabel}**`;
   return { panelHint, trackLabel };
 }
@@ -261,6 +314,48 @@ export function skip(guildId, actorUserId = null) {
   const queue = getQueueOps(id);
   const currentUrl = currentPlayingUrlByGuild.get(id) ?? '';
   const tail = getIdleBackForwardTail(id);
+
+  // Prefetch pool invalidation перед stop, чтобы ранкер следующего спавна/pop
+  // уже видел «чистое» состояние. Quick-skip = сильный негативный сигнал
+  // (контекст кластера плохой) → чистим оба бакета и бампаем generation,
+  // чтобы любые pending-писатели prefetch-раннера стали stale.
+  // Обычный skip = mild (один конкретный трек неинтересен) → pop head.
+  if (currentUrl) {
+    const elapsedMs = getElapsedSinceLastStart(id, currentUrl);
+    const quickSkip = elapsedMs != null && elapsedMs < getQuickSkipThresholdMs();
+    if (quickSkip) {
+      invalidatePool(id, 'quick_skip');
+      incrementPrefetchGeneration(id);
+      invalidateAutoplaySpawn(id);
+        try {
+          const currentItem = currentQueueItemByGuild.get(id) ?? null;
+          const currentTitle = currentPlayingLabelByGuild.get(id) ?? '';
+          if (isAutoplayArtistQuarantineEnabled()) {
+            const currentArtist = resolveCurrentTrackArtistForQuarantine(currentTitle, currentItem);
+            quarantineArtistForNextSpawns(id, currentArtist);
+          }
+          const transition = maybeApplyAutoplayEscapeQuickSkipTransitions({
+            guildId: id,
+            currentItem,
+          currentTitle,
+          elapsedMs,
+        });
+        if (!transition.handled) {
+          maybeTriggerAutoplayEscapeTrialFromQuickSkip({
+            guildId: id,
+            sessionId: getSessionId(id),
+            currentItem,
+            currentUrl,
+            currentTitle,
+          });
+        }
+      } catch (e) {
+        console.warn('[music] autoplay escape trigger failed', e);
+      }
+    } else {
+      invalidatePool(id, 'skip');
+    }
+  }
 
   executeSkipPreStopMachine({
     guildId: id,
@@ -370,6 +465,7 @@ export function previousTrack(guildId, actorUserId = null) {
       actor: actorUserId,
       requestedBy: currentItem?.requestedBy ?? null,
       triggeredBy: 'navigation',
+      spawnId: currentItem?.spawnId ?? null,
       listenersCount: getListenersCount(id),
       url: currentUrl,
       title: currentPlayingLabelByGuild.get(id) ?? '',
@@ -427,14 +523,34 @@ export function toggleRepeat(guildId) {
 export function toggleAutoplay(guildId) {
   const id = String(guildId);
   if (autoplayByGuild.has(id)) {
+    clearAutoplayEscapeState(id);
+    clearArtistQuarantineState(id);
     autoplayByGuild.delete(id);
     // При выключении автоплея отбрасываем pending spawn'ы (чтобы по завершении
-    // поиска, идущего прямо сейчас, в очередь не попала лишняя подборка).
+    // поиска, идущего прямо сейчас, в очередь не попала лишняя подборка) и
+    // чистим prefetch-пул — закэшированные кандидаты больше не нужны, а при
+    // повторном включении ∞ контекст будет другой.
     invalidateAutoplaySpawn(id);
-    return false;
-  }
+      invalidatePool(id, 'autoplay_off');
+      return false;
+    }
   autoplayByGuild.add(id);
   repeatByGuild.delete(id);
+
+  const { playerState } = resolvePlayerUIState(id);
+  const status = getPlayerStatus(id);
+  const statusStr = status?.toString?.() ?? '';
+  const paused = statusStr === 'paused' || statusStr === 'autopaused';
+  const playing = isPlayerPlaying(id);
+  const loading = playerState === PlayerState.LOADING;
+  const inVoice = isConnectionAlive(id);
+
+  if (shouldKickAutoplayOnEnable({ inVoice, playing, paused, loading })) {
+    ensureGuildMusicState(id);
+    setPlayerState(id, PlayerState.LOADING, StatusReason.NONE);
+    void schedulePlayNext(id, 'toggle-autoplay');
+  }
+
   return true;
 }
 
@@ -459,6 +575,9 @@ export function stopAndLeave(guildId) {
   const id = String(guildId);
   const s = getGuildMusicState(id);
 
+  clearAutoplayEscapeState(id);
+  clearArtistQuarantineState(id);
+
   resetStopAndLeaveOperationalState(id, {
     invalidateAutoplaySpawn,
     resetAutoplayRecoveryStreak,
@@ -477,6 +596,7 @@ export function stopAndLeave(guildId) {
     clearSignalBuffer,
     resetPlaybackMetricsSession,
     clearQueue,
+    clearPrefetchPool: clearPool,
   });
 
   teardownGuildPlaybackState(
@@ -588,30 +708,8 @@ export function getMusicTransportState(guildId) {
   const loading = playerState === PlayerState.LOADING;
   const inVoice = isConnectionAlive(id);
 
-  const hasActiveTrack = (playing || paused || loading) && inVoice;
-
   const pastLen = getPastTrackUrls(id).length;
   const sessLen = getSessionPlayedWatchUrls(id).length;
-
-  let canPrevious = false;
-  if (inVoice && !loading) {
-    if (playing || paused) {
-      canPrevious = pastLen > 0;
-    } else {
-      canPrevious = sessLen > 0;
-    }
-  }
-
-  const canSkipForward =
-    (playing || paused) && inVoice && !loading && (
-      getQueueLength(id) > 0 ||
-      autoplayByGuild.has(id) ||
-      getIdleBackForwardTail(id) != null
-    );
-
-  // Оба тоггла симметричны: только при активном треке. См. доку выше.
-  const canRepeatToggle = (playing || paused) && inVoice && !loading;
-  const canAutoplayToggle = (playing || paused) && inVoice && !loading;
 
   // Ретроспективный лайк: IDLE_EXHAUSTED пока currentPlayingLabelByGuild
   // ещё помнит последний трек (до stopAndLeave полного teardown'а).
@@ -619,20 +717,20 @@ export function getMusicTransportState(guildId) {
     playerState === PlayerState.IDLE_EXHAUSTED &&
     inVoice &&
     currentPlayingLabelByGuild.has(id);
-  const canLike = hasActiveTrack || hasRememberedTrack;
 
-  return {
-    hasActiveTrack,
+  return resolveMusicTransportFlags({
+    inVoice,
+    playing,
     paused,
-    canPrevious,
-    canSkipForward,
-    canRepeatToggle,
-    canAutoplayToggle,
-    canLike,
-    repeat: repeatByGuild.has(id),
-    autoplay: autoplayByGuild.has(id),
     loading,
-  };
+    queueLength: getQueueLength(id),
+    autoplay: autoplayByGuild.has(id),
+    repeat: repeatByGuild.has(id),
+    idleBackForwardAvailable: getIdleBackForwardTail(id) != null,
+    pastLen,
+    sessLen,
+    hasRememberedTrack,
+  });
 }
 
 /**
@@ -665,4 +763,134 @@ export function getCurrentPlaybackInfo(guildId) {
     label,
     queueDepth: getQueueLength(id),
   };
+}
+
+/**
+ * Resolve the artist token for quick-skip quarantine using the live track
+ * title first and queue-item channel metadata as a Topic fallback.
+ *
+ * @param {string | null | undefined} currentTitle
+ * @param {{ channelName?: string | null } | null | undefined} currentItem
+ * @returns {string | null}
+ */
+export function resolveCurrentTrackArtistForQuarantine(currentTitle, currentItem) {
+  return extractLeadArtistTokenFromTitle(
+    String(currentTitle ?? ''),
+    { channelName: currentItem?.channelName ?? null },
+  );
+}
+
+/**
+ * Build the user-visible label and queue-item title for a newly enqueued track.
+ * Direct URLs may resolve to a canonical media title; queries keep the raw text.
+ *
+ * @param {string} rawQuery
+ * @param {string | null | undefined} resolvedDirectTitle
+ * @returns {{ trackLabel: string, queueItemTitle: string | null }}
+ */
+export function buildEnqueueTrackPresentation(rawQuery, resolvedDirectTitle) {
+  const fallback = String(rawQuery ?? '').trim();
+  const resolved = String(resolvedDirectTitle ?? '').trim();
+  const trackLabel = resolved || fallback;
+  const queueItemTitle = resolved && !/^https?:\/\//i.test(resolved)
+    ? trackLabel
+    : null;
+  return { trackLabel, queueItemTitle };
+}
+
+/**
+ * Pure transport-state resolver for the music panel.
+ * Kept separate so idle/autoplay edge-cases stay testable without live voice/player mocks.
+ *
+ * @param {{
+ *   inVoice: boolean,
+ *   playing: boolean,
+ *   paused: boolean,
+ *   loading: boolean,
+ *   queueLength: number,
+ *   autoplay: boolean,
+ *   repeat: boolean,
+ *   idleBackForwardAvailable: boolean,
+ *   pastLen: number,
+ *   sessLen: number,
+ *   hasRememberedTrack: boolean,
+ * }} input
+ */
+export function resolveMusicTransportFlags(input) {
+  const {
+    inVoice,
+    playing,
+    paused,
+    loading,
+    queueLength,
+    autoplay,
+    repeat,
+    idleBackForwardAvailable,
+    pastLen,
+    sessLen,
+    hasRememberedTrack,
+  } = input;
+
+  const hasActiveTrack = (playing || paused || loading) && inVoice;
+
+  let canPrevious = false;
+  if (inVoice && !loading) {
+    if (playing || paused) {
+      canPrevious = pastLen > 0;
+    } else {
+      canPrevious = sessLen > 0;
+    }
+  }
+
+  const canSkipForward =
+    (playing || paused) && inVoice && !loading && (
+      queueLength > 0 ||
+      autoplay ||
+      idleBackForwardAvailable
+    );
+
+  // Autoplay toggle must stay available while connected but idle; otherwise
+  // enabling infinity immediately traps the panel in a disabled state.
+  const canRepeatToggle = (playing || paused) && inVoice && !loading;
+  const canAutoplayToggle = inVoice && !loading;
+  const canLike = hasActiveTrack || hasRememberedTrack;
+
+  return {
+    hasActiveTrack,
+    paused,
+    canPrevious,
+    canSkipForward,
+    canRepeatToggle,
+    canAutoplayToggle,
+    canLike,
+    repeat,
+    autoplay,
+    loading,
+  };
+}
+
+/**
+ * Whether turning autoplay ON should immediately kick the playback loop.
+ *
+ * @param {{
+ *   inVoice: boolean,
+ *   playing: boolean,
+ *   paused: boolean,
+ *   loading: boolean,
+ }} input
+ */
+export function shouldKickAutoplayOnEnable(input) {
+  const { inVoice, playing, paused, loading } = input;
+  return inVoice && !playing && !paused && !loading;
+}
+
+/**
+ * Whether user enqueue should immediately kick the playback loop.
+ * Enqueue must never replace an already active or loading track.
+ *
+ * @param {{ playing: boolean, paused: boolean, loading: boolean }} input
+ */
+export function shouldKickPlaybackOnEnqueue(input) {
+  const { playing, paused, loading } = input;
+  return !playing && !paused && !loading;
 }

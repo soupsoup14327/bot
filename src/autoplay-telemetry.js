@@ -1,4 +1,4 @@
-﻿/**
+/**
  * METRICS:DEBUG — стадии автоплея и формы промптов Groq.
  * Куда: при METRICS_TXT_ENABLED≠0 → data/metrics/autoplay-debug.txt; иначе stdout [autoplay:debug]
  * Вкл: AUTOPLAY_DEBUG=1
@@ -58,8 +58,11 @@ export function autoplayGroqDebug(stage, meta) {
 }
 
 export function isAutoplayArtistCooldownEnabled() {
+  // Default ON: выключается только явным `=0` / `=false`. Cooldown блокирует
+  // кандидатов от артистов, доминирующих в недавнем плейбеке — ключевой
+  // anti-repeat guard при ∞ (см. docs/АРХИТЕКТУРА.md#artist-cooldown).
   const v = String(process.env.AUTOPLAY_ARTIST_COOLDOWN_ENABLED ?? '').toLowerCase().trim();
-  return v === '1' || v === 'true';
+  return v !== '0' && v !== 'false';
 }
 
 export function getAutoplayArtistCooldownWindow() {

@@ -32,6 +32,7 @@ export function resetStopAndLeaveOperationalState(guildId, deps) {
  *   clearSignalBuffer: (guildId: string) => void,
  *   resetPlaybackMetricsSession: (guildId: string) => void,
  *   clearQueue: (guildId: string) => void,
+ *   clearPrefetchPool?: (guildId: string) => void,
  * }} deps
  */
 export function clearStopAndLeaveRuntimeState(guildId, deps) {
@@ -45,6 +46,9 @@ export function clearStopAndLeaveRuntimeState(guildId, deps) {
   deps.clearSignalBuffer(guildId);
   deps.resetPlaybackMetricsSession(guildId);
   deps.clearQueue(guildId);
+  if (typeof deps.clearPrefetchPool === 'function') {
+    deps.clearPrefetchPool(guildId);
+  }
 }
 
 /**

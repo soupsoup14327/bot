@@ -50,6 +50,7 @@ import {
   getSessionId,
   getPrefetchGeneration,
 } from './guild-session-state.js';
+import { getAutoplayEscapePrefetchMode } from './autoplay-escape-state.js';
 import {
   storeFast,
   storeFull,
@@ -60,9 +61,48 @@ import {
   countTrailingAlternateStreak,
   searchOnceForPrefetch,
 } from './youtube-search.js';
-import { detectDominantArtist } from './autoplay-artist-tokens.js';
+import {
+  detectDominantArtist,
+  extractLeadArtistTokenFromTitle as extractLeadArtistToken,
+} from './autoplay-artist-tokens.js';
+import { buildDistinctArtistShortlist } from './autoplay-distinct-artists.js';
 import { getNegativeContext, getPositiveContext } from './recommendation-bridge.js';
 import { autoplayDebug } from './autoplay-telemetry.js';
+
+function buildPrefetchBatchId(phase, sessionId, generation) {
+  return `prefetch:${String(phase)}:${String(sessionId ?? 'no-session')}:${Number(generation)}:${Date.now()}`;
+}
+
+/**
+ * Translate escape-prefetch mode into runner behavior.
+ *
+ * @param {import('./autoplay-escape-state.js').AutoplayEscapePrefetchMode} prefetchMode
+ * @returns {{ prefetchMode: import('./autoplay-escape-state.js').AutoplayEscapePrefetchMode, skipRunner: boolean, runFast: boolean, runFull: boolean }}
+ */
+export function buildAutoplayPrefetchRunPlan(prefetchMode) {
+  if (prefetchMode === 'off') {
+    return {
+      prefetchMode,
+      skipRunner: true,
+      runFast: false,
+      runFull: false,
+    };
+  }
+  if (prefetchMode === 'cheap') {
+    return {
+      prefetchMode,
+      skipRunner: false,
+      runFast: true,
+      runFull: false,
+    };
+  }
+  return {
+    prefetchMode: 'normal',
+    skipRunner: false,
+    runFast: true,
+    runFull: true,
+  };
+}
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -114,11 +154,17 @@ export function runProactivePrefetch(guildId, seedQuery, ctx) {
     );
     return;
   }
+  const plan = buildAutoplayPrefetchRunPlan(getAutoplayEscapePrefetchMode(id));
+  if (plan.skipRunner) return;
   if (isAutoplayResolving(id)) return;
   if (getPoolSize(id) >= PROACTIVE_PREFETCH_MIN_POOL) return;
 
-  void _runFastPhase(id, seedQuery, ctx);
-  void _runFullPhase(id, seedQuery, ctx);
+  if (plan.runFast) {
+    void _runFastPhase(id, seedQuery, ctx);
+  }
+  if (plan.runFull) {
+    void _runFullPhase(id, seedQuery, ctx);
+  }
 }
 
 // ─── Phase 1: Fast ────────────────────────────────────────────────────────────
@@ -174,7 +220,14 @@ async function _runFastPhase(guildId, seedQuery, ctx) {
     }
 
     // ── Quality guards — same contract as full spawn, without variety penalty ─
-    const ranked = rankAutoplayCandidates(results, {
+    const distinctShortlist = buildDistinctArtistShortlist(results, {
+      extractLeadArtistToken,
+    });
+    autoplayDebug(id, 'prefetch-fast', {
+      phase: 'distinct_shortlist',
+      ...distinctShortlist.meta,
+    });
+    const ranked = rankAutoplayCandidates(distinctShortlist.items, {
       isMarkedBad:             (url) => isPlayabilityHardSkipEnabled() && isUrlMarkedBad(url),
       isRecentBlocked:         (url) => ctx.isUrlBlocked(url),
       isArtistCooldownBlocked: () => false,
@@ -193,7 +246,11 @@ async function _runFastPhase(guildId, seedQuery, ctx) {
     }
 
     // storeFast: writes to :fast, does NOT bump generation
-    const toStore = valid.slice(0, FAST_CANDIDATES_MAX);
+    const fastBatchId = buildPrefetchBatchId('fast', capturedSessionId, capturedGen);
+    const toStore = valid.slice(0, FAST_CANDIDATES_MAX).map((item) => ({
+      ...item,
+      spawnId: fastBatchId,
+    }));
     storeFast(id, { sessionId: capturedSessionId, generation: capturedGen, candidates: toStore });
 
     const elapsed = Date.now() - tStart;
@@ -330,14 +387,25 @@ async function _runFullPhase(guildId, seedQuery, ctx) {
     }
     if (!ctx.isAutoplayOn()) return;
 
-    const items = rawItems;
+    const fullBatchId = buildPrefetchBatchId('full', capturedSessionId, capturedGen);
+    const items = rawItems.map((item) => ({
+      ...item,
+      spawnId: fullBatchId,
+    }));
     if (!items.length) {
       autoplayDebug(id, 'prefetch-full', { phase: 'no_results' });
       return;
     }
 
     // ── Quality guards ───────────────────────────────────────────────────────
-    const ranked = rankAutoplayCandidates(items, {
+    const distinctShortlist = buildDistinctArtistShortlist(items, {
+      extractLeadArtistToken,
+    });
+    autoplayDebug(id, 'prefetch-full', {
+      phase: 'distinct_shortlist',
+      ...distinctShortlist.meta,
+    });
+    const ranked = rankAutoplayCandidates(distinctShortlist.items, {
       isMarkedBad:             (url) => isPlayabilityHardSkipEnabled() && isUrlMarkedBad(url),
       isRecentBlocked:         (url) => ctx.isUrlBlocked(url),
       isArtistCooldownBlocked: () => false,

@@ -1,0 +1,33 @@
+PAWPAW autoplay notes
+Updated: 2026-04-19
+
+1. Что уже зафиксировано
+- Escape branch закрывает аварийный redirection после явного rejection, но не является главным источником diversity.
+- Основное однообразие сейчас рождается раньше: в retrieval, sequential early-exit search и в составе candidate shortlist.
+- После quick-skip допустимо ограниченное повторение того же исполнителя, но это должно быть исключением, а не нормой.
+
+2. Что уже есть в коде
+- Escape rollout отделён feature flag'ом `AUTOPLAY_ESCAPE_ENABLED`.
+- Distinct-by-artist shortlist и hard artist quarantine уже существуют, но по умолчанию выключены.
+- Quick-skip quarantine теперь умеет использовать `channelName` из queue item как fallback для Topic-каналов, если artist не читается из title.
+
+3. Как это понимать сейчас
+- Если новые candidate-layer фичи выключены, UX почти не меняется: escape помогает только после жёсткого rejection, но не лечит основную монотонность.
+- Даже при включённом escape можно снова услышать тот же кластер, если retrieval рано выходит в узкий basin или если shortlist собирается вокруг одного артиста.
+- Повтор того же исполнителя сразу после skip не всегда баг: это может быть soft-cooldown, parser miss или просто текущий компромисс retrieval.
+
+4. Практичный rollout
+- Для локальной проверки нового UX достаточно включить:
+  AUTOPLAY_DISTINCT_ARTIST_SHORTLIST_ENABLED=1
+  AUTOPLAY_ARTIST_QUARANTINE_ENABLED=1
+- `AUTOPLAY_ESCAPE_ENABLED` лучше выкатывать отдельно, чтобы не смешивать эффекты candidate diversity и emergency redirection.
+
+5. Что даёт это теоретически
+- Distinct shortlist уменьшает монотонность до ranker-а: один артист не занимает первую волну кандидатов.
+- Artist quarantine делает quick-skip более "слышным": следующий autoplay spawn не подсовывает того же lead artist сразу снова.
+- Escape остаётся emergency backstop, когда rejection относится уже не к одному треку, а к целому basin.
+
+6. Что смотреть дальше
+- Расширять artist parsing на реальные JP/anison/Topic кейсы и не размножать парсеры по коду.
+- Ослаблять sequential early-exit: для diversity полезнее merge нескольких query-кластеров до ranker-а, а не останавливаться на первом удачном.
+- Подключать same_family wiring только после того, как будет понятен эффект distinct shortlist + quarantine на живом трафике.

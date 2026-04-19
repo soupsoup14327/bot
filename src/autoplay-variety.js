@@ -11,7 +11,11 @@ const recentArtistsByGuild = new Map();
 const recentFamiliesByGuild = new Map();
 
 export function isVarietyControllerEnabled() {
-  return String(process.env.AUTOPLAY_VARIETY_CONTROLLER_ENABLED ?? '').trim() === '1';
+  // Default ON: выключается только явным `=0` / `=false`. Контроллер
+  // штрафует повторы артистов и query-family при ранкинге и критически
+  // важен для anti-repeat UX при ∞ (см. docs/АРХИТЕКТУРА.md#variety).
+  const v = String(process.env.AUTOPLAY_VARIETY_CONTROLLER_ENABLED ?? '').trim().toLowerCase();
+  return v !== '0' && v !== 'false';
 }
 
 function envNumber(name, fallback, min, max) {

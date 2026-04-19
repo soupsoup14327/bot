@@ -85,6 +85,11 @@ import {
 } from './idle-navigation-state.js';
 import { resolveIdleVerdict } from './player-idle-verdict.js';
 import {
+  confirmAutoplayEscapeBranch,
+  getAutoplayEscapeSnapshot,
+  markAutoplayEscapeTrackStarted,
+} from './autoplay-escape-state.js';
+import {
   autoplayByGuild,
   currentPlayingLabelByGuild,
   currentPlayingUrlByGuild,
@@ -247,12 +252,25 @@ function handlePlayerIdle(id) {
     const finUrl = currentPlayingUrlByGuild.get(id) ?? '';
     const finTitle = currentPlayingLabelByGuild.get(id) ?? '';
     const finItem = currentQueueItemByGuild.get(id);
+    const escapeSnapshot = getAutoplayEscapeSnapshot(id);
+    if (
+      (escapeSnapshot.phase === 'trial' || escapeSnapshot.phase === 'provisional') &&
+      finItem?.spawnId != null &&
+      escapeSnapshot.currentSpawnId === finItem.spawnId
+    ) {
+      confirmAutoplayEscapeBranch(id, {
+        reason: 'playback_track_finished',
+        source: finItem.source ?? null,
+        title: finTitle,
+      });
+    }
     void recordPlaybackHistory({
       eventType: 'finished',
       guildId: id,
       sessionId: getSessionId(id),
       requestedBy: finItem?.requestedBy ?? null,
       triggeredBy: sourceToTriggeredBy(finItem?.source),
+      spawnId: finItem?.spawnId ?? null,
       listenersCount: getListenersCount(id),
       url: finUrl,
       title: finTitle,
@@ -263,6 +281,7 @@ function handlePlayerIdle(id) {
       actor: null,                                           // natural finish — no user actor
       requestedBy: finItem?.requestedBy ?? null,
       triggeredBy: sourceToTriggeredBy(finItem?.source),
+      spawnId: finItem?.spawnId ?? null,
       listenersCount: getListenersCount(id),
       url: finUrl,
       title: finTitle,
@@ -472,6 +491,18 @@ async function runPlayNext(guildId) {
 
     /** Запомним QueueItem сейчас играющего — нужно для toggleRepeat в середине трека. */
     currentQueueItemByGuild.set(id, nextItem);
+    const escapeSnapshot = getAutoplayEscapeSnapshot(id);
+    if (
+      escapeSnapshot.phase === 'trial' &&
+      nextItem.spawnId != null &&
+      escapeSnapshot.currentSpawnId === nextItem.spawnId
+    ) {
+      markAutoplayEscapeTrackStarted(id, nextItem.spawnId, {
+        reason: 'playback_track_started',
+        source: nextItem.source,
+        title: label,
+      });
+    }
     setPlayerState(id, PlayerState.PLAYING);
     /** Source теперь известен — emit после set. */
     void emitSignal('track_started', {
@@ -480,6 +511,7 @@ async function runPlayNext(guildId) {
       actor: null,                                           // started by playback loop, not a user action
       requestedBy: nextItem.requestedBy ?? null,
       triggeredBy: sourceToTriggeredBy(nextItem.source),
+      spawnId: nextItem.spawnId ?? null,
       listenersCount: getListenersCount(id),
       url: currentPlayingUrlByGuild.get(id) ?? nextItem.url,
       title: currentPlayingLabelByGuild.get(id) ?? nextItem.url,

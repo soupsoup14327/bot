@@ -153,10 +153,13 @@ async function smokePureFunctions() {
   assert(isPlayabilityHardSkipEnabled() === false, 'playability-cache hard skip default off');
   assert(isFastLaneEnabled() === false, 'fast lane default off');
   assert(isVarietyBudget7030Experimental() === false, 'variety 70/30 experimental default off');
-  assert(isVarietyControllerEnabled() === false, 'variety controller default off');
   const prevVarCtl = process.env.AUTOPLAY_VARIETY_CONTROLLER_ENABLED;
+  process.env.AUTOPLAY_VARIETY_CONTROLLER_ENABLED = '0';
+  assert(isVarietyControllerEnabled() === false, 'variety controller explicit off');
   process.env.AUTOPLAY_VARIETY_CONTROLLER_ENABLED = '1';
   assert(isVarietyControllerEnabled() === true, 'variety controller on');
+  delete process.env.AUTOPLAY_VARIETY_CONTROLLER_ENABLED;
+  assert(isVarietyControllerEnabled() === true, 'variety controller default on');
   const vg = 'verify-variety-guild';
   assert(computeVarietyRankPenalty(vg, 'Alpha Artist - Track One').penalty === 0, 'variety no history');
   recordVarietyStateAfterSpawn(vg, {

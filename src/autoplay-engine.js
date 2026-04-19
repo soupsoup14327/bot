@@ -69,6 +69,8 @@ function buildStrategyQueries(snap, baseQueries, effectiveSeed) {
  *   alternateStreakFast: number,
  *   currentPlayingLabel: string | null,
  *   serverHints: string[],
+ *   escapeContrastHint?: { from: 'same_spawn' | 'same_family', anchor: string | null } | null,
+ *   dFallbackPrompt?: string | null,
  * }} AutoplayEngineSnapshot
  */
 
@@ -86,6 +88,11 @@ export async function pickAutoplayRetrieval(snapshot, hooks = {}) {
   const usedQueries = snapshot.usedQueries ?? [];
   const pivotToAnchor = Boolean(snapshot.pivotToAnchor);
   const serverHints = snapshot.serverHints ?? [];
+  const escapeContrastHint = snapshot.escapeContrastHint ?? null;
+  const dFallbackPrompt = String(snapshot.dFallbackPrompt ?? '').trim() || null;
+  const escapeMode = Boolean(escapeContrastHint);
+  const dFallbackMode = Boolean(dFallbackPrompt);
+  const specialRetrievalMode = escapeMode || dFallbackMode;
 
   let searchQueries;
   let usedToken;
@@ -96,7 +103,7 @@ export async function pickAutoplayRetrieval(snapshot, hooks = {}) {
   let groqTrace = null;
 
   const sessionTitlesForFast = snapshot.sessionTitlesForFast ?? [];
-  const fastLanePlan = tryBuildFastLaneRetrievalPlan({
+  const fastLanePlan = specialRetrievalMode ? null : tryBuildFastLaneRetrievalPlan({
     pivotToAnchor,
     lastIntent: snapshot.lastIntent,
     initialSeed: snapshot.initialSeed,
@@ -217,11 +224,14 @@ export async function pickAutoplayRetrieval(snapshot, hooks = {}) {
           };
         } catch (queryErr) {
           onGroqCall?.();
-          const fallback =
-            snapshot.lastIntent ??
-            snapshot.initialSeed ??
-            snapshot.currentPlayingLabel ??
-            String(effectiveSeed).split('\n')[0].replace(/^[^:]+:\s*/, '').trim();
+          const fallback = specialRetrievalMode
+            ? String(effectiveSeed).split('\n')[0].replace(/^[^:]+:\s*/, '').trim()
+            : (
+              snapshot.lastIntent ??
+              snapshot.initialSeed ??
+              snapshot.currentPlayingLabel ??
+              String(effectiveSeed).split('\n')[0].replace(/^[^:]+:\s*/, '').trim()
+            );
           searchQueries = [variantAutoplayQuery(fallback)];
           usedToken = fallback;
           debug?.('query-source', { mode: 'fallback-after-legacy-fail', count: searchQueries.length });
@@ -240,10 +250,13 @@ export async function pickAutoplayRetrieval(snapshot, hooks = {}) {
       }
       }
     } else {
-      const fallback =
-        snapshot.lastIntent ??
-        snapshot.initialSeed ??
-        String(effectiveSeed).split('\n')[0].replace(/^[^:]+:\s*/, '').trim();
+      const fallback = specialRetrievalMode
+        ? String(effectiveSeed).split('\n')[0].replace(/^[^:]+:\s*/, '').trim()
+        : (
+          snapshot.lastIntent ??
+          snapshot.initialSeed ??
+          String(effectiveSeed).split('\n')[0].replace(/^[^:]+:\s*/, '').trim()
+        );
       searchQueries = [variantAutoplayQuery(fallback)];
       usedToken = fallback;
       const mode = isGroqConfigured() ? 'non_groq_median' : 'fallback-no-groq';
@@ -256,16 +269,20 @@ export async function pickAutoplayRetrieval(snapshot, hooks = {}) {
     }
   }
 
-  const strategyQueries = buildStrategyQueries(
-    {
-      lastIntent: snapshot.lastIntent,
-      initialSeed: snapshot.initialSeed,
-      topic: snapshot.topic,
-    },
-    searchQueries,
-    effectiveSeed,
-  );
-  const allQueriesRaw = serverHints[0] ? [...strategyQueries, serverHints[0]] : strategyQueries;
+  const strategyQueries = specialRetrievalMode
+    ? searchQueries
+    : buildStrategyQueries(
+      {
+        lastIntent: snapshot.lastIntent,
+        initialSeed: snapshot.initialSeed,
+        topic: snapshot.topic,
+      },
+      searchQueries,
+      effectiveSeed,
+    );
+  const allQueriesRaw = specialRetrievalMode
+    ? strategyQueries
+    : (serverHints[0] ? [...strategyQueries, serverHints[0]] : strategyQueries);
   const policy = applyAutoplayQueryPolicy({
     queries: allQueriesRaw,
     recentTitles: playedTitles,
@@ -296,12 +313,23 @@ export async function pickAutoplayRetrieval(snapshot, hooks = {}) {
     querySource = isGroqConfigured() ? 'non_groq_median' : 'no_groq';
     retrievalPath = isGroqConfigured() ? 'non_groq_median' : 'no_groq_config';
   }
+  if (escapeMode) {
+    querySource = `escape:${querySource}`;
+    retrievalPath = `escape:${retrievalPath}`;
+  } else if (dFallbackMode) {
+    querySource = `d_fallback:${querySource}`;
+    retrievalPath = `d_fallback:${retrievalPath}`;
+  }
   debug?.('retrieval-path', {
     retrievalPath,
     querySource,
     recoveryGroqOnly: recoveryOnlyTelemetry,
     recoveryStreak: streakTelemetry,
     recoveryStreakMin: streakMinTelemetry,
+    escapeMode,
+    dFallbackMode,
+    escapeFrom: escapeContrastHint?.from ?? null,
+    escapeAnchor: escapeContrastHint?.anchor ?? null,
   });
 
   groqTrace = groqTrace
